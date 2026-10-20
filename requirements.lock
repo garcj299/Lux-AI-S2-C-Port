@@ -1,0 +1,35 @@
+# Exact versions of the reference environment (luxai_s2 on Python 3.14.8).
+# vec-noise 1.1.4 is not listed: it comes from third_party/vec-noise (patched),
+# see third_party/vec-noise/LOCAL-PATCH.md.
+#
+# Rebuild on a new machine:
+#   python3 -m venv .venv
+#   .venv/bin/pip install --no-deps -r requirements.lock
+#   then build and install vec-noise as third_party/vec-noise/LOCAL-PATCH.md says
+#   patch -p1 -d .venv/lib/python3.14/site-packages < third_party/Lux-Design-S2/patches/luxai_runner-python311.patch
+#   .venv/bin/pip check
+# pygame 2.6.1 has no prebuilt wheel for Python 3.14, so pip builds it from source against the
+# system SDL2 libraries; without the SDL2 font library its font module is left out.
+cloudpickle==3.1.2
+contourpy==1.4.0
+cycler==0.12.1
+Farama-Notifications==0.0.6
+fonttools==4.67.0
+gymnasium==1.4.0
+kiwisolver==1.5.1
+luxai-s2==3.0.1
+matplotlib==3.11.2
+numpy==2.5.4
+packaging==26.3
+pettingzoo==1.27.0
+pillow==13.0.0
+pip==26.2.2
+pygame==2.6.1
+pyparsing==3.3.3
+python-dateutil==2.9.0.post0
+scipy==1.18.1
+setuptools==84.2.1
+six==1.17.0
+termcolor==3.3.0
+typing_extensions==4.16.0
+wheel==0.48.0

@@ -1,0 +1,20 @@
+--- a/luxai_runner/episode.py	2026-10-21 01:06:52.676248210 +0200
++++ b/luxai_runner/episode.py	2026-10-21 01:07:34.957963786 +0200
+@@ -28,7 +28,7 @@
+     verbosity: Optional[int] = 1
+     render: Optional[bool] = True
+     save_replay_path: Optional[str] = None
+-    replay_options: ReplayConfig = ReplayConfig()
++    replay_options: ReplayConfig = dataclasses.field(default_factory=ReplayConfig)
+ 
+ 
+ class Episode:
+@@ -101,7 +101,7 @@
+             player.proc.log.identifier = player.log.identifier
+             players[player.agent] = player
+             start_tasks += [player.proc.start()]
+-        await asyncio.wait(start_tasks, return_when=asyncio.ALL_COMPLETED)
++        await asyncio.wait([asyncio.ensure_future(t) for t in start_tasks], return_when=asyncio.ALL_COMPLETED)
+ 
+         metadata = dict()
+ 
