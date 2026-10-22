@@ -11,7 +11,7 @@
 #   .venv/bin/pip check
 # pygame 2.6.1 has no prebuilt wheel for Python 3.14, so pip builds it from source against the
 # system SDL2 libraries; without the SDL2 font library its font module is silently left out and the
-# engine's viewer (scripts/watch_live.py) crashes at pygame.font.init(). If that happened, install
+# engine's window (lux live) crashes at pygame.font.init(). If that happened, install
 # sdl2_ttf and rebuild: .venv/bin/pip install --force-reinstall --no-deps --no-cache-dir pygame==2.6.1
 cloudpickle==3.1.2
 contourpy==1.4.0

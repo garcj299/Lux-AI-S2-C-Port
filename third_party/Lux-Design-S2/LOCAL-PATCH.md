@@ -15,7 +15,7 @@ Neither touches the game rules. Apply it to the installed runner after installin
 
     patch -p1 -d .venv/lib/python3.14/site-packages < third_party/Lux-Design-S2/patches/luxai_runner-python311.patch
 
-Known, not fixed: the runner's `--render` opens no window, because it creates the engine with the default `render_mode="rgb_array"`. Use `scripts/watch_live.py` for a live window.
+Known, not fixed: the runner's `--render` opens no window, because it creates the engine with the default `render_mode="rgb_array"`. Use `lux live` (see `scripts/lux.py`) for a live window: it runs the same official runner with the engine in `render_mode="human"`.
 
 ### `lux-eye-s2/dist/`
 The viewer, built locally so it works offline. Upstream's `lux-eye-s2/.gitignore` ignores `dist`, so git doesn't track it. To rebuild (needs internet once, for its JavaScript dependencies), from a copy outside the repository so `node_modules` (~300 MB) stays out:

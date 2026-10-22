@@ -5,18 +5,22 @@
 The end-to-end tests play real games (a few seconds each) and never open a real browser:
 they point Python's `webbrowser` at a fake one through the BROWSER environment variable.
 """
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 import lux
@@ -126,6 +130,169 @@ class OutcomeTest(unittest.TestCase):
 
     def test_equal_scores_are_a_draw(self):
         self.assertEqual(lux.outcome({"player_0": -1000, "player_1": -1000}), "draw")
+
+
+class LiveTitleTest(unittest.TestCase):
+    def test_shows_seed_and_turn(self):
+        self.assertEqual(lux.live_title(7, 85), "lux live — seed 7 — turn 85")
+        self.assertEqual(lux.live_title(7, 0), "lux live — seed 7 — turn 0")
+
+    def test_bidding_and_factory_placement_show_as_setup(self):
+        self.assertEqual(lux.live_title(7, -3), "lux live — seed 7 — setup")
+
+
+class DummyDisplayTestCase(unittest.TestCase):
+    """pygame on SDL's dummy video driver: windows are drawn in memory, never shown.
+    Events (closing the window, keys) are posted from a helper thread, as SDL allows."""
+
+    def setUp(self):
+        lux.engine()  # imports pygame the quiet way
+        import pygame
+
+        self.pygame = pygame
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        old_driver = os.environ.get("SDL_VIDEODRIVER")
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+        self.addCleanup(lambda: os.environ.pop("SDL_VIDEODRIVER") if old_driver is None
+                        else os.environ.__setitem__("SDL_VIDEODRIVER", old_driver))
+        self.addCleanup(os.chdir, os.getcwd())  # lux plays from the repository folder
+        self.addCleanup(pygame.quit)
+
+    def post_later(self, seconds, event_type, **attributes):
+        def post():
+            time.sleep(seconds)
+            self.pygame.event.post(self.pygame.event.Event(event_type, **attributes))
+
+        threading.Thread(target=post, daemon=True).start()
+
+    def close_events(self):
+        pygame = self.pygame
+        return {"window X": (pygame.QUIT, {}), "Esc": (pygame.KEYDOWN, {"key": pygame.K_ESCAPE}),
+                "Q": (pygame.KEYDOWN, {"key": pygame.K_q})}
+
+
+class LiveTest(DummyDisplayTestCase):
+    def test_plays_the_same_game_as_web(self):
+        live_scores = lux.live(7, Path(self.tmp.name) / "live.json", delay=0)
+        self.pygame.quit()
+        web_scores = lux.play(7, Path(self.tmp.name) / "web.json")
+        live = json.loads((Path(self.tmp.name) / "live.json").read_text())
+        web = json.loads((Path(self.tmp.name) / "web.json").read_text())
+        self.assertEqual(live["actions"], web["actions"])
+        self.assertEqual(live["observations"], web["observations"])
+        self.assertEqual({p: int(s) for p, s in live_scores.items()}, {p: int(s) for p, s in web_scores.items()})
+
+    def test_band_above_the_board_shows_each_team_in_its_color(self):
+        lux.live(7, Path(self.tmp.name) / "live.json", delay=0)
+        window = self.pygame.display.get_surface()
+        band = lux.BAND_HEIGHT
+        # The engine draws a 64x64 map at 1000 // 64 = 15 px a tile: 960 px. The band sits on top.
+        self.assertEqual(window.get_size(), (960, 960 + band))
+        self.assertEqual(tuple(window.get_at((1, 1)))[:3], lux.BAND_BACKGROUND)
+        self.assertNotEqual(tuple(window.get_at((1, band + 1)))[:3], lux.BAND_BACKGROUND, "board missing")
+        # A board drawn under the band instead would leave the window's bottom rows unpainted (black).
+        self.assertNotEqual(tuple(window.get_at((1, 960 + band - 2)))[:3], (0, 0, 0), "board not below the band")
+        band_colors = {tuple(window.get_at((x, y)))[:3] for x in range(960) for y in range(band)}
+        self.assertIn((224, 65, 40), band_colors, "no player_0 text (the engine's red)")
+        self.assertIn((0, 112, 81), band_colors, "no player_1 text (the engine's green)")
+
+    def test_delay_paces_the_turns_shown_in_the_title(self):
+        # At 0.25 s a step, 2 s cover at most 8 steps: still in setup (bids and factory placement,
+        # about 18 steps for seed 7). Drawing alone takes ~0.04 s a step, so without the delay it would be ~turn 30.
+        titles = []
+
+        def look_then_close():
+            time.sleep(2.0)
+            titles.append(self.pygame.display.get_caption()[0])
+            self.pygame.event.post(self.pygame.event.Event(self.pygame.QUIT))
+
+        threading.Thread(target=look_then_close, daemon=True).start()
+        with self.assertRaises(lux.LuxError):
+            lux.live(7, Path(self.tmp.name) / "live.json", delay=0.25)
+        self.assertEqual(titles, ["lux live — seed 7 — setup"])
+
+    def test_closing_mid_game_stops_it_without_a_replay_or_bots(self):
+        for name, (event_type, attributes) in self.close_events().items():
+            with self.subTest(name):
+                replay = Path(self.tmp.name) / f"{name}.json"
+                self.post_later(1.0, event_type, **attributes)
+                started = time.monotonic()
+                with self.assertRaisesRegex(lux.LuxError, "closed"):
+                    lux.live(7, replay, delay=0.02)  # ~4 s if it ran to the end
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertFalse(replay.exists())
+                self.assertFalse(self.pygame.display.get_init(), "the window should be gone")
+                bots = subprocess.run(["pgrep", "-P", str(os.getpid())], capture_output=True, text=True).stdout
+                self.assertEqual(bots, "", "bot processes left running")
+
+
+class LiveCommandTest(DummyDisplayTestCase):
+    def test_live_saves_the_replay_and_prints_the_summary(self):
+        replays = Path(self.tmp.name) / "replays"
+
+        def close_when_saved():
+            while not list(replays.glob("*.json")):
+                time.sleep(0.05)
+            self.pygame.event.post(self.pygame.event.Event(self.pygame.QUIT))
+
+        threading.Thread(target=close_when_saved, daemon=True).start()
+        out = io.StringIO()
+        with mock.patch.object(lux, "REPLAYS_DIR", replays), contextlib.redirect_stdout(out):
+            code = lux.main(["live", "7", "--delay", "0"])
+        self.assertEqual(code, 0)
+        (replay,) = replays.glob("*.json")
+        self.assertRegex(replay.name, r"_seed7\.json$")
+        self.assertIn("Seed 7: game over at turn", out.getvalue())
+        self.assertIn(f"Replay: {replay}", out.getvalue())
+
+
+class WaitUntilClosedTest(DummyDisplayTestCase):
+    def open_window(self):
+        self.pygame.display.init()
+        self.pygame.display.set_mode((64, 64))
+
+    def test_returns_once_the_window_is_closed(self):
+        for name, (event_type, attributes) in self.close_events().items():
+            with self.subTest(name):
+                self.open_window()
+                self.post_later(0.3, event_type, **attributes)
+                started = time.monotonic()
+                lux.wait_until_closed()
+                self.assertGreaterEqual(time.monotonic() - started, 0.3)
+                self.assertFalse(self.pygame.display.get_init(), "the window should be gone")
+
+    def test_other_keys_keep_it_open(self):
+        self.open_window()
+        self.post_later(0.1, self.pygame.KEYDOWN, key=self.pygame.K_a)
+        self.post_later(0.5, self.pygame.QUIT)
+        started = time.monotonic()
+        lux.wait_until_closed()
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+
+
+class BandTextTest(unittest.TestCase):
+    def test_seed_turn_then_each_team(self):
+        self.assertEqual(
+            lux.band_text(7, 85, {"player_0": 4, "player_1": 3}, {"player_0": 120, "player_1": 95}),
+            ["seed 7 · turn 85", "player_0: 4 factories, 120 lichen", "player_1: 3 factories, 95 lichen"])
+
+    def test_setup_before_the_first_turn(self):
+        self.assertEqual(lux.band_text(7, -5, {"player_0": 1, "player_1": 0}, {"player_0": 0, "player_1": 0})[0],
+                         "seed 7 · setup")
+
+    def test_one_factory_is_singular(self):
+        self.assertEqual(lux.band_text(7, 3, {"player_0": 1, "player_1": 2}, {"player_0": 0, "player_1": 0})[1],
+                         "player_0: 1 factory, 0 lichen")
+
+    def test_a_team_with_no_factories_left_has_lost(self):
+        # The engine scores a team that lost every factory at -1000.
+        self.assertEqual(lux.band_text(7, 151, {"player_0": 0, "player_1": 2}, {"player_0": -1000, "player_1": 30})[1],
+                         "player_0: lost all factories")
+
+    def test_no_scores_yet_reads_as_zero_lichen(self):
+        self.assertEqual(lux.band_text(7, -18, {"player_0": 0, "player_1": 0}, {})[2],
+                         "player_1: 0 factories, 0 lichen")
 
 
 def fetch(url):
@@ -317,6 +484,32 @@ class CommandTest(TempRepoTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([line.split()[0] for line in result.stdout.splitlines()], ["2", "1"])
         self.assertIn("seed 2", result.stdout.splitlines()[-1])
+
+    def test_help_shows_how_to_use_every_command(self):
+        result = self.lux("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for usage in ("lux web [SEED]", "lux web --replay [N | PATH]", "lux live [SEED] [--delay S]",
+                      "lux list [--all]"):
+            self.assertIn(usage, result.stdout)
+
+    def test_live_without_a_display_says_so_without_playing(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "SDL_VIDEODRIVER")}
+        result = subprocess.run([str(self.bin / "lux"), "live", "7"], cwd=self.elsewhere, env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("display", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.replays.exists())
+        output = result.stdout + result.stderr
+        self.assertNotIn("avx2", output)
+        self.assertNotIn("Hello from the pygame community", output)
+
+    def test_negative_delay_is_refused_without_playing(self):
+        result = self.lux("live", "7", "--delay", "-1")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--delay", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.replays.exists())
 
     def test_missing_environment_says_how_to_create_it(self):
         (self.repo / ".venv").unlink()
