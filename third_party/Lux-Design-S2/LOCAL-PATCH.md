@@ -27,4 +27,4 @@ The viewer, built locally so it works offline. Upstream's `lux-eye-s2/.gitignore
 
 Gotcha: `yarn install` also runs the package's `prepublish` script, which builds `dist/` pointing every file at unpkg.com (internet). The explicit `build --base=./` afterwards replaces it with relative paths.
 
-To use it: `python3 -m http.server 8000 -d third_party/Lux-Design-S2/lux-eye-s2/dist`, open http://localhost:8000, and load a replay JSON file. Browsers won't run it straight from `file://`. Loading from Kaggle or a URL needs internet; loading a file doesn't.
+To use it: `lux web --replay PATH` (see `scripts/lux.py`) serves it and opens the replay in the browser. By hand: `python3 -m http.server 8000 -d third_party/Lux-Design-S2/lux-eye-s2/dist`, open http://localhost:8000, and load a replay JSON file. Browsers won't run it straight from `file://`. Loading from Kaggle or a URL needs internet; loading a file doesn't.

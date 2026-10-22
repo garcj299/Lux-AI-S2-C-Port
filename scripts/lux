@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Runs scripts/lux.py with this repository's .venv, from any folder.
+# install.sh links it as ~/.local/bin/lux.
+repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+python="$repo/.venv/bin/python"
+if [[ ! -x "$python" ]]; then
+    echo "lux: no Python environment in $repo/.venv" >&2
+    echo "Create it as the header of $repo/requirements.lock explains." >&2
+    exit 1
+fi
+exec "$python" "$repo/scripts/lux.py" "$@"

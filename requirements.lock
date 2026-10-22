@@ -3,13 +3,16 @@
 # see third_party/vec-noise/LOCAL-PATCH.md.
 #
 # Rebuild on a new machine:
+#   install the system SDL2 font library first (Arch: sudo pacman -S sdl2_ttf; others: the SDL2_ttf dev package)
 #   python3 -m venv .venv
 #   .venv/bin/pip install --no-deps -r requirements.lock
 #   then build and install vec-noise as third_party/vec-noise/LOCAL-PATCH.md says
 #   patch -p1 -d .venv/lib/python3.14/site-packages < third_party/Lux-Design-S2/patches/luxai_runner-python311.patch
 #   .venv/bin/pip check
 # pygame 2.6.1 has no prebuilt wheel for Python 3.14, so pip builds it from source against the
-# system SDL2 libraries; without the SDL2 font library its font module is left out.
+# system SDL2 libraries; without the SDL2 font library its font module is silently left out and the
+# engine's viewer (scripts/watch_live.py) crashes at pygame.font.init(). If that happened, install
+# sdl2_ttf and rebuild: .venv/bin/pip install --force-reinstall --no-deps --no-cache-dir pygame==2.6.1
 cloudpickle==3.1.2
 contourpy==1.4.0
 cycler==0.12.1
