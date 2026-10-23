@@ -26,7 +26,12 @@ build/liblux.so: $(OBJ)
 build:
 	mkdir -p build
 
+# the differential tester against the Python engine, with the repository's .venv
+test: build/liblux.so
+	PYGAME_HIDE_SUPPORT_PROMPT=1 ../.venv/bin/python -W ignore tests/scenarios.py
+	PYGAME_HIDE_SUPPORT_PROMPT=1 ../.venv/bin/python -W ignore tests/difftest.py --games 20 --quiet
+
 clean:
 	rm -rf build
 
-.PHONY: all clean
+.PHONY: all test clean

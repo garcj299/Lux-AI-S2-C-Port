@@ -39,6 +39,34 @@ int64_t lux_real_env_steps(const lux_state *state)
     return state->env_steps;
 }
 
+int32_t lux_layout(int64_t *out, int32_t n)
+{
+    const int64_t layout[] = {
+        (int64_t)sizeof(lux_config),
+        (int64_t)sizeof(lux_unit_config),
+        (int64_t)sizeof(lux_action),
+        (int64_t)sizeof(lux_unit),
+        (int64_t)sizeof(lux_factory),
+        (int64_t)sizeof(lux_team),
+        (int64_t)sizeof(lux_board),
+        (int64_t)sizeof(lux_state),
+        (int64_t)sizeof(lux_command),
+        (int64_t)sizeof(lux_agent_commands),
+        (int64_t)sizeof(lux_step_result),
+        (int64_t)offsetof(lux_config, ROBOTS),
+        (int64_t)offsetof(lux_unit, action_queue),
+        (int64_t)offsetof(lux_state, teams),
+        (int64_t)offsetof(lux_state, board),
+        (int64_t)offsetof(lux_state, factories),
+        (int64_t)offsetof(lux_state, units),
+    };
+    const int32_t count = (int32_t)(sizeof(layout) / sizeof(layout[0]));
+    for (int32_t i = 0; i < n && i < count; i++) {
+        out[i] = layout[i];
+    }
+    return count;
+}
+
 lux_workspace *lux_workspace_new(void)
 {
     lux_workspace *ws = calloc(1, sizeof(*ws));

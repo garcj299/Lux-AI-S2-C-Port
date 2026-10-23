@@ -245,6 +245,15 @@ LUX_API void lux_state_free(lux_state *state);
 /* state.py State.real_env_steps: env_steps minus the bid and placement turns. */
 LUX_API int64_t lux_real_env_steps(const lux_state *state);
 
+/* The sizes and offsets of this header's types, for bindings in other languages
+ * to check their copy of the layout against. Writes up to n values to out, in
+ * this order, and returns how many there are:
+ *   sizeof lux_config, lux_unit_config, lux_action, lux_unit, lux_factory,
+ *   lux_team, lux_board, lux_state, lux_command, lux_agent_commands,
+ *   lux_step_result; offsetof lux_config.ROBOTS, lux_unit.action_queue,
+ *   lux_state.teams, lux_state.board, lux_state.factories, lux_state.units. */
+LUX_API int32_t lux_layout(int64_t *out, int32_t n);
+
 /* ---- Actions for one turn ----------------------------------------------------- */
 
 /* Which branch a key of the actions dict takes in Python's step(): a key holding
