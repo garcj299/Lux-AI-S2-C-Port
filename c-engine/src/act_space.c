@@ -14,7 +14,7 @@ int act_space_contains(const lux_state *s, int32_t team, const lux_agent_command
     }
     for (int32_t i = 0; i < cmds->n_commands; i++) {
         const lux_command *c = &cmds->commands[i];
-        if (c->kind == LUX_KEY_UNIT && c->id >= 0 && lux_find_unit(s, team, c->id) >= 0) {
+        if (c->kind == LUX_KEY_UNIT && lux_find_unit(s, team, c->id) >= 0) {
             /* ActionsQueue.contains */
             if (c->n_actions > cfg->UNIT_ACTION_QUEUE_SIZE) {
                 return 0;
@@ -24,7 +24,7 @@ int act_space_contains(const lux_state *s, int32_t team, const lux_agent_command
                     return 0;
                 }
             }
-        } else if (c->kind == LUX_KEY_FACTORY && c->id >= 0 && lux_find_factory(s, team, c->id) >= 0) {
+        } else if (c->kind == LUX_KEY_FACTORY && lux_find_factory(s, team, c->id) >= 0) {
             /* Discrete(3).contains */
             if (!(c->factory_action >= 0 && c->factory_action < 3)) {
                 return 0;

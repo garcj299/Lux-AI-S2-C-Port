@@ -47,6 +47,12 @@ static inline int64_t py_max(int64_t a, int64_t b)
     return b > a ? b : a;
 }
 
+/* NumPy's clip(lo, hi) of one value: min(max(v, lo), hi), so hi wins when hi < lo */
+static inline int64_t py_clip(int64_t v, int64_t lo, int64_t hi)
+{
+    return py_min(py_max(v, lo), hi);
+}
+
 /* math.floor and math.ceil of a double, as ints */
 static inline int64_t py_floor(double x)
 {

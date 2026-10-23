@@ -1,9 +1,10 @@
 """Moves a game between the Python engine and the C engine, and compares them.
 
-- load_state(lib, env): a new C state holding a copy of a live Python game.
 - snapshot_python(env) and snapshot_c(state): the whole game in one plain form,
-  so the two engines can be compared field by field.
-- compare(py, c): where the two snapshots differ.
+  the same for both engines, so they can be compared field by field.
+- load_state(lib, env): a new C state holding a copy of a live Python game, which
+  is snapshot_python(env) written into C (the inverse of snapshot_c).
+- compare(py, c): where two snapshots differ.
 - commands_from_actions(actions): a step's actions dict as the C engine takes it.
 - check_python_invariants(env): what the C engine assumes about every Python
   state, checked on the real thing.
@@ -17,6 +18,18 @@ import luxc
 
 PLAYERS = ("player_0", "player_1")
 UNIT_TYPES = {"LIGHT": luxc.LIGHT, "HEAVY": luxc.HEAVY}
+INT64_MAX = 2**63 - 1
+
+
+def entity_number(key, prefix):
+    """N if key is exactly prefix followed by N, written as Python writes ints and
+    small enough for an int64 ("unit_12", not "unit_012"); else None."""
+    if not key.startswith(prefix):
+        return None
+    digits = key[len(prefix) :]
+    if not re.fullmatch(r"0|[1-9][0-9]*", digits) or int(digits) > INT64_MAX:
+        return None
+    return int(digits)
 
 
 # ---- Python -> C ------------------------------------------------------------------
@@ -38,110 +51,115 @@ def config_from_python(env_cfg):
     return cfg
 
 
-def _entity_number(entity_id, prefix):
-    """N of "unit_N" / "factory_N"; the engine only makes ids of this form."""
-    number = int(entity_id[len(prefix) :])
-    assert entity_id == f"{prefix}{number}", entity_id
-    return number
-
-
 def load_state(lib, env):
     """A new C state (a ctypes pointer, freed with lib.lux_state_free) holding a copy
-    of env's game. Copies what lux.h says a state holds, including each factory's
-    lichen counts, which only the live factory objects carry."""
-    state = env.state
-    cfg = config_from_python(state.env_cfg)
+    of env's game. snapshot_python reads everything lux.h says a state holds,
+    including each factory's lichen counts, which only the live factory objects
+    carry; this writes it into C."""
+    cfg = config_from_python(env.state.env_cfg)
     if lib.lux_config_check(cfg) != luxc.OK:
         raise ValueError("this config is outside what the C engine supports")
     ptr = lib.lux_state_new(cfg)
     if not ptr:
         raise MemoryError("lux_state_new failed")
-    cs = ptr.contents
-
-    cs.env_steps = int(state.env_steps)
-    cs.global_id = int(state.global_id)
-    cs.done = 0 if env.agents else 1
-
-    n = state.env_cfg.map_size
-    board = state.board
-    cs.board.factories_per_team = int(board.factories_per_team)
-    for name in luxc.GRIDS:
-        grid = np.ctypeslib.as_array(getattr(cs.board, name))
-        grid[: n * n] = np.asarray(getattr(board, name), dtype=np.int64).reshape(-1)
-    mask = np.ctypeslib.as_array(cs.board.valid_spawns_mask)
-    mask[: n * n] = np.asarray(board.valid_spawns_mask, dtype=np.uint8).reshape(-1)
-
-    for t, player in enumerate(PLAYERS):
-        team = state.teams[player]
-        ct = cs.teams[t]
-        ct.team_id = team.team_id
-        ct.faction = team.faction.value.faction_id
-        ct.init_water = int(team.init_water)
-        ct.init_metal = int(team.init_metal)
-        ct.factories_to_place = int(team.factories_to_place)
-        ct.bid = int(team.bid)
-        ct.place_first = int(bool(team.place_first))
-        ct.n_factory_strains = len(team.factory_strains)
-        for k, strain in enumerate(team.factory_strains):
-            ct.factory_strains[k] = int(strain)
-
-        units = list(state.units[player].values())
-        cs.n_units[t] = len(units)
-        for i, unit in enumerate(units):
-            cu = cs.units[t][i]
-            cu.unit_id = _entity_number(unit.unit_id, "unit_")
-            cu.team_id = unit.team_id
-            cu.unit_type = UNIT_TYPES[unit.unit_type.name]
-            cu.x, cu.y = int(unit.pos.x), int(unit.pos.y)
-            cu.power = int(unit.power)
-            cu.ice, cu.ore = int(unit.cargo.ice), int(unit.cargo.ore)
-            cu.water, cu.metal = int(unit.cargo.water), int(unit.cargo.metal)
-            cu.queue_len = len(unit.action_queue)
-            for k, action in enumerate(unit.action_queue):
-                values = [int(v) for v in action.state_dict()]
-                cu.action_queue[k] = luxc.Action(*values)
-
-        factories = list(state.factories[player].values())
-        cs.n_factories[t] = len(factories)
-        for i, factory in enumerate(factories):
-            cf = cs.factories[t][i]
-            cf.num_id = int(factory.num_id)
-            assert factory.unit_id == f"factory_{factory.num_id}", factory.unit_id
-            cf.team_id = factory.team_id
-            cf.x, cf.y = int(factory.pos.x), int(factory.pos.y)
-            cf.power = int(factory.power)
-            cf.ice, cf.ore = int(factory.cargo.ice), int(factory.cargo.ore)
-            cf.water, cf.metal = int(factory.cargo.water), int(factory.cargo.metal)
-            cf.queue_len = len(factory.action_queue)
-            for k, action in enumerate(factory.action_queue):
-                cf.action_queue[k] = int(action.state_dict())
-            cf.grow_lichen_count = len(factory.grow_lichen_positions)
-            cf.connected_lichen_count = len(factory.connected_lichen_positions)
+    try:
+        write_snapshot(ptr, snapshot_python(env))
+    except BaseException:
+        lib.lux_state_free(ptr)
+        raise
     return ptr
 
 
-_CANONICAL_ID = re.compile(r"(?:unit|factory)_(0|[1-9][0-9]*)")
+def write_snapshot(ptr, snap):
+    """Writes a snapshot into a C state: the inverse of snapshot_c."""
+    cs = ptr.contents
+    n = cs.env_cfg.map_size
+    cs.env_steps = snap["env_steps"]
+    cs.global_id = snap["global_id"]
+    cs.done = int(snap["done"])
+    cs.board.factories_per_team = snap["board"]["factories_per_team"]
+    for name in (*luxc.GRIDS, "valid_spawns_mask"):
+        np.ctypeslib.as_array(getattr(cs.board, name))[: n * n] = snap["board"][name].reshape(-1)
+    for t in range(2):
+        team, ct = snap["teams"][t], cs.teams[t]
+        for field in ("team_id", "faction", "init_water", "init_metal", "factories_to_place", "bid"):
+            setattr(ct, field, team[field])
+        ct.place_first = int(team["place_first"])
+        _fill(ct.factory_strains, team["factory_strains"], "factory_strains")
+        ct.n_factory_strains = len(team["factory_strains"])
+
+        _check_fits(snap["units"][t], luxc.MAX_UNITS_PER_TEAM, "units")
+        cs.n_units[t] = len(snap["units"][t])
+        for cu, unit in zip(cs.units[t], snap["units"][t]):
+            cu.unit_id, cu.team_id, cu.unit_type, cu.power = unit["unit_id"], unit["team_id"], unit["unit_type"], unit["power"]
+            cu.x, cu.y = unit["pos"]
+            cu.ice, cu.ore, cu.water, cu.metal = unit["cargo"]
+            _fill(cu.action_queue, [luxc.Action(*a) for a in unit["action_queue"]], "a unit's queue")
+            cu.queue_len = len(unit["action_queue"])
+
+        _check_fits(snap["factories"][t], luxc.MAX_FACTORIES_PER_TEAM, "factories")
+        cs.n_factories[t] = len(snap["factories"][t])
+        for cf, factory in zip(cs.factories[t], snap["factories"][t]):
+            cf.num_id, cf.team_id, cf.power = factory["num_id"], factory["team_id"], factory["power"]
+            cf.x, cf.y = factory["pos"]
+            cf.ice, cf.ore, cf.water, cf.metal = factory["cargo"]
+            _fill(cf.action_queue, factory["action_queue"], "a factory's queue")
+            cf.queue_len = len(factory["action_queue"])
+            cf.grow_lichen_count = factory["grow_lichen_count"]
+            cf.connected_lichen_count = factory["connected_lichen_count"]
+
+
+def _check_fits(values, capacity, what):
+    if len(values) > capacity:
+        raise ValueError(f"{len(values)} {what} don't fit the C engine's {capacity}")
+
+
+def _fill(array, values, what):
+    _check_fits(values, len(array), what)
+    for k, value in enumerate(values):
+        array[k] = value
+
+
+# ---- Actions ----------------------------------------------------------------------
 
 
 def _key_to_command(key):
     """kind and id of an actions-dict key, as lux.h's lux_command defines them."""
+    if not isinstance(key, str):
+        raise TypeError(f"the C engine takes only string keys, not {key!r}")
     if "factory" in key:
         kind, prefix = luxc.KEY_FACTORY, "factory_"
     elif "unit" in key:
         kind, prefix = luxc.KEY_UNIT, "unit_"
     else:
         return luxc.KEY_OTHER, -1
-    match = _CANONICAL_ID.fullmatch(key)
-    if match and key.startswith(prefix):
-        return kind, int(match.group(1))
-    return kind, -1
+    number = entity_number(key, prefix)
+    return kind, -1 if number is None else number
+
+
+def _unit_rows(key, value):
+    """A unit's actions as an int64 (rows, 6) array. Python takes other forms too
+    (lists, 1-D arrays, floats) and treats them in ways a lux_command can't say, so
+    those raise TypeError: the caller must not send them (see lux.h)."""
+    if isinstance(value, np.ndarray) and value.size == 0 and value.ndim <= 2:
+        return np.zeros((0, 6), dtype=np.int64)
+    if not (isinstance(value, np.ndarray) and value.ndim == 2 and value.shape[1] == 6):
+        raise TypeError(f"{key}: the C engine takes unit actions as (n, 6) arrays only, not {value!r}")
+    try:
+        return np.ascontiguousarray(value.astype(np.int64, casting="safe"))
+    except TypeError:
+        raise TypeError(f"{key}: the C engine takes integer actions only, not {value.dtype}") from None
+
+
+def _factory_action(key, value):
+    if not isinstance(value, (int, np.integer)) or np.ndim(value) != 0 or not -(2**63) <= int(value) <= INT64_MAX:
+        raise TypeError(f"{key}: the C engine takes a factory action as one int64, not {value!r}")
+    return int(value)
 
 
 def commands_from_actions(actions):
     """The actions dict as (luxc.AgentCommands * 2), plus the arrays it points
-    into, which must stay alive until lux_step returns. Unit actions must be 2-D
-    int arrays (or lists of 6-number rows) and factory actions ints: the forms
-    the C engine can take (see lux.h)."""
+    into, which must stay alive until lux_step returns."""
     keep = []
     agents = (luxc.AgentCommands * 2)()
     for t, player in enumerate(PLAYERS):
@@ -152,9 +170,9 @@ def commands_from_actions(actions):
             c = commands[i]
             c.kind, c.id = _key_to_command(key)
             if c.kind == luxc.KEY_FACTORY:
-                c.factory_action = int(value)
+                c.factory_action = _factory_action(key, value)
             elif c.kind == luxc.KEY_UNIT:
-                rows = np.ascontiguousarray(np.asarray(value, dtype=np.int64).reshape(-1, 6))
+                rows = _unit_rows(key, value)
                 keep.append(rows)
                 c.n_actions = len(rows)
                 c.actions = rows.ctypes.data_as(POINTER(luxc.Action)) if len(rows) else None
@@ -167,6 +185,7 @@ def commands_from_actions(actions):
 
 
 def snapshot_python(env):
+    """The whole Python game, in the form snapshot_c gives the C one."""
     state = env.state
     board = state.board
     snap = {
@@ -198,7 +217,7 @@ def snapshot_python(env):
         snap["units"].append(
             [
                 {
-                    "unit_id": _entity_number(u.unit_id, "unit_"),
+                    "unit_id": _number(u.unit_id, "unit_"),
                     "team_id": u.team_id,
                     "unit_type": UNIT_TYPES[u.unit_type.name],
                     "pos": (int(u.pos.x), int(u.pos.y)),
@@ -212,7 +231,7 @@ def snapshot_python(env):
         snap["factories"].append(
             [
                 {
-                    "num_id": int(f.num_id),
+                    "num_id": _number(f.unit_id, "factory_", int(f.num_id)),
                     "team_id": f.team_id,
                     "pos": (int(f.pos.x), int(f.pos.y)),
                     "power": int(f.power),
@@ -227,7 +246,16 @@ def snapshot_python(env):
     return snap
 
 
+def _number(entity_id, prefix, expected=None):
+    """N of the ids the engine makes, "unit_N" and "factory_N"."""
+    number = entity_number(entity_id, prefix)
+    if number is None or expected not in (None, number):
+        raise ValueError(f"{entity_id} isn't an id the engine makes")
+    return number
+
+
 def snapshot_c(ptr):
+    """The whole C game, in the form snapshot_python gives the Python one."""
     cs = ptr.contents
     n = cs.env_cfg.map_size
     snap = {
@@ -344,7 +372,7 @@ def check_python_invariants(env):
     problems = []
     alive = {}
     for player in PLAYERS:
-        ids = [_entity_number(u.unit_id, "unit_") for u in state.units[player].values()]
+        ids = [_number(u.unit_id, "unit_") for u in state.units[player].values()]
         if ids != sorted(set(ids)):
             problems.append(f"{player}'s units are not in increasing id order: {ids}")
         nums = [int(f.num_id) for f in state.factories[player].values()]

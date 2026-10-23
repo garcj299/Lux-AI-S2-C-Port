@@ -1,35 +1,66 @@
 """ctypes bindings for the C engine: c-engine/include/lux.h, field for field.
 
-load() checks these structures against the sizes and offsets the library reports
-(lux_layout), so a change to lux.h that isn't copied here fails at once instead of
-corrupting memory.
+load() checks every structure, field and constant here against the table the
+library reports (lux_layout), by name, so a change to lux.h that isn't copied
+here fails at once instead of corrupting memory.
 """
 import ctypes
-from ctypes import POINTER, Structure, c_double, c_int32, c_int64, c_uint8, c_void_p
+from ctypes import POINTER, Structure, c_char_p, c_double, c_int32, c_int64, c_uint8, c_void_p
 from pathlib import Path
 
 LIB_PATH = Path(__file__).resolve().parent.parent / "build" / "liblux.so"
 
-MAX_MAP_SIZE = 64
-MAX_TILES = MAX_MAP_SIZE * MAX_MAP_SIZE
-MAX_FACTORIES_PER_TEAM = 10
-MAX_UNITS_PER_TEAM = MAX_TILES + MAX_FACTORIES_PER_TEAM
-MAX_QUEUE = 20
-FACTORY_QUEUE_CAP = 4
-
-OK = 0
-ERRORS = {
-    -1: "LUX_ERR_ARGUMENT",
-    -2: "LUX_ERR_GAME_OVER",
-    -3: "LUX_ERR_EARLY_GAME",
-    -4: "LUX_ERR_CONFIG",
-    -5: "LUX_ERR_STATE",
-    -6: "LUX_ERR_CAPACITY",
-    -7: "LUX_ERR_NO_MEMORY",
+# lux.h's constants, by their C names
+CONSTANTS = {
+    "LUX_MAX_MAP_SIZE": 64,
+    "LUX_MAX_TILES": 64 * 64,
+    "LUX_MAX_FACTORIES_PER_TEAM": 10,
+    "LUX_MAX_UNITS_PER_TEAM": 64 * 64 + 10,
+    "LUX_MAX_QUEUE": 20,
+    "LUX_FACTORY_QUEUE_CAP": 1,
+    "LUX_OK": 0,
+    "LUX_ERR_ARGUMENT": -1,
+    "LUX_ERR_GAME_OVER": -2,
+    "LUX_ERR_EARLY_GAME": -3,
+    "LUX_ERR_CONFIG": -4,
+    "LUX_ERR_STATE": -5,
+    "LUX_LIGHT": 0,
+    "LUX_HEAVY": 1,
+    "LUX_ALPHA_STRIKE": 0,
+    "LUX_MOTHER_MARS": 1,
+    "LUX_THE_BUILDERS": 2,
+    "LUX_FIRST_MARS": 3,
+    "LUX_MOVE": 0,
+    "LUX_TRANSFER": 1,
+    "LUX_PICKUP": 2,
+    "LUX_DIG": 3,
+    "LUX_SELF_DESTRUCT": 4,
+    "LUX_RECHARGE": 5,
+    "LUX_BUILD_LIGHT": 0,
+    "LUX_BUILD_HEAVY": 1,
+    "LUX_WATER": 2,
+    "LUX_KEY_UNIT": 0,
+    "LUX_KEY_FACTORY": 1,
+    "LUX_KEY_OTHER": 2,
 }
 
-LIGHT, HEAVY = 0, 1
-KEY_UNIT, KEY_FACTORY, KEY_OTHER = 0, 1, 2
+MAX_MAP_SIZE = CONSTANTS["LUX_MAX_MAP_SIZE"]
+MAX_TILES = CONSTANTS["LUX_MAX_TILES"]
+MAX_FACTORIES_PER_TEAM = CONSTANTS["LUX_MAX_FACTORIES_PER_TEAM"]
+MAX_UNITS_PER_TEAM = CONSTANTS["LUX_MAX_UNITS_PER_TEAM"]
+MAX_QUEUE = CONSTANTS["LUX_MAX_QUEUE"]
+FACTORY_QUEUE_CAP = CONSTANTS["LUX_FACTORY_QUEUE_CAP"]
+
+OK = CONSTANTS["LUX_OK"]
+ERRORS = {value: name for name, value in CONSTANTS.items() if name.startswith("LUX_ERR_")}
+ERR_ARGUMENT = CONSTANTS["LUX_ERR_ARGUMENT"]
+ERR_GAME_OVER = CONSTANTS["LUX_ERR_GAME_OVER"]
+ERR_EARLY_GAME = CONSTANTS["LUX_ERR_EARLY_GAME"]
+ERR_CONFIG = CONSTANTS["LUX_ERR_CONFIG"]
+ERR_STATE = CONSTANTS["LUX_ERR_STATE"]
+
+LIGHT, HEAVY = CONSTANTS["LUX_LIGHT"], CONSTANTS["LUX_HEAVY"]
+KEY_UNIT, KEY_FACTORY, KEY_OTHER = CONSTANTS["LUX_KEY_UNIT"], CONSTANTS["LUX_KEY_FACTORY"], CONSTANTS["LUX_KEY_OTHER"]
 
 
 class UnitConfig(Structure):
@@ -199,27 +230,46 @@ class StepResult(Structure):
     ]
 
 
-def _expected_layout():
-    """What lux_layout must report, in its order."""
-    return [
-        ctypes.sizeof(Config),
-        ctypes.sizeof(UnitConfig),
-        ctypes.sizeof(Action),
-        ctypes.sizeof(Unit),
-        ctypes.sizeof(Factory),
-        ctypes.sizeof(Team),
-        ctypes.sizeof(Board),
-        ctypes.sizeof(State),
-        ctypes.sizeof(Command),
-        ctypes.sizeof(AgentCommands),
-        ctypes.sizeof(StepResult),
-        Config.ROBOTS.offset,
-        Unit.action_queue.offset,
-        State.teams.offset,
-        State.board.offset,
-        State.factories.offset,
-        State.units.offset,
+class LayoutEntry(Structure):
+    _fields_ = [
+        ("name", c_char_p),
+        ("value", c_int64),
     ]
+
+
+# each structure above, by its C name
+STRUCTS = {
+    "lux_unit_config": UnitConfig,
+    "lux_config": Config,
+    "lux_action": Action,
+    "lux_unit": Unit,
+    "lux_factory": Factory,
+    "lux_team": Team,
+    "lux_board": Board,
+    "lux_state": State,
+    "lux_command": Command,
+    "lux_agent_commands": AgentCommands,
+    "lux_step_result": StepResult,
+    "lux_layout_entry": LayoutEntry,
+}
+
+
+def expected_layout():
+    """What lux_layout must report: every structure's size, every field's offset
+    and size, and the constants, by the names lux_layout uses."""
+    expected = dict(CONSTANTS)
+    for cname, struct in STRUCTS.items():
+        expected[f"sizeof({cname})"] = ctypes.sizeof(struct)
+        for field, _ in struct._fields_:
+            expected[f"offsetof({cname}, {field})"] = getattr(struct, field).offset
+            expected[f"sizeof({cname}.{field})"] = getattr(struct, field).size
+    return expected
+
+
+def reported_layout(lib):
+    entries = POINTER(LayoutEntry)()
+    count = lib.lux_layout(ctypes.byref(entries))
+    return {entries[i].name.decode(): entries[i].value for i in range(count)}
 
 
 def load(path=LIB_PATH):
@@ -238,7 +288,7 @@ def load(path=LIB_PATH):
     lib.lux_state_free.restype = None
     lib.lux_real_env_steps.argtypes = [POINTER(State)]
     lib.lux_real_env_steps.restype = c_int64
-    lib.lux_layout.argtypes = [POINTER(c_int64), c_int32]
+    lib.lux_layout.argtypes = [POINTER(POINTER(LayoutEntry))]
     lib.lux_layout.restype = c_int32
     lib.lux_workspace_new.argtypes = []
     lib.lux_workspace_new.restype = c_void_p
@@ -247,14 +297,14 @@ def load(path=LIB_PATH):
     lib.lux_step.argtypes = [POINTER(State), c_void_p, POINTER(AgentCommands), POINTER(StepResult)]
     lib.lux_step.restype = ctypes.c_int
 
-    expected = _expected_layout()
-    reported = (c_int64 * len(expected))()
-    count = lib.lux_layout(reported, len(expected))
-    if count != len(expected) or list(reported) != expected:
-        raise SystemExit(
-            f"luxc.py doesn't match lux.h: the library reports {list(reported)[:count]} "
-            f"({count} values), these bindings expect {expected}"
-        )
+    expected, reported = expected_layout(), reported_layout(lib)
+    if reported != expected:
+        problems = [
+            f"{name}: lux.h {reported.get(name, 'has no such entry')}, luxc.py {expected.get(name, 'has no such entry')}"
+            for name in sorted(set(expected) | set(reported))
+            if expected.get(name) != reported.get(name)
+        ]
+        raise SystemExit("luxc.py doesn't match lux.h:\n  " + "\n  ".join(problems))
     return lib
 
 

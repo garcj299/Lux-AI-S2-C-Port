@@ -93,7 +93,11 @@ int lux_config_check(const lux_config *cfg)
     if (cfg->UNIT_ACTION_QUEUE_SIZE < 0 || cfg->UNIT_ACTION_QUEUE_SIZE > LUX_MAX_QUEUE) {
         return LUX_ERR_CONFIG;
     }
-    if (!cfg->validate_action_space) {
+    if (!cfg->validate_action_space || !cfg->BIDDING_SYSTEM) {
+        return LUX_ERR_CONFIG;
+    }
+    /* destroying robots in any order leaves the same rubble only when they add some */
+    if (cfg->ROBOTS[LUX_LIGHT].RUBBLE_AFTER_DESTRUCTION < 0 || cfg->ROBOTS[LUX_HEAVY].RUBBLE_AFTER_DESTRUCTION < 0) {
         return LUX_ERR_CONFIG;
     }
     /* divisors: Python would raise ZeroDivisionError */

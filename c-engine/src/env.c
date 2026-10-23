@@ -6,11 +6,10 @@
 /* ---- Game logic ------------------------------------------------------------- */
 
 /* LuxAI_S2.add_unit */
-static int add_unit(lux_state *s, lux_workspace *ws, int32_t team, int32_t unit_type, int64_t x, int64_t y)
+static void add_unit(lux_state *s, lux_workspace *ws, int32_t team, int32_t unit_type, int64_t x, int64_t y)
 {
-    if (s->n_units[team] >= LUX_MAX_UNITS_PER_TEAM) {
-        return LUX_ERR_CAPACITY;
-    }
+    /* at most one unit per tile, plus one build per factory (see check_units) */
+    assert(s->n_units[team] < LUX_MAX_UNITS_PER_TEAM);
     int32_t index = s->n_units[team];
     lux_unit *unit = &s->units[team][index];
     unit_init(unit, &s->env_cfg, team, unit_type, s->global_id);
@@ -18,15 +17,12 @@ static int add_unit(lux_state *s, lux_workspace *ws, int32_t team, int32_t unit_
     unit->y = y;
     s->global_id += 1;
     s->n_units[team] += 1;
-    ws->dead[team][index] = 0;
 
+    /* the factory's center held at most one unit, and only this factory builds there */
     int32_t tile = lux_tile(s, x, y);
-    if (ws->umap_n[tile] >= LUX_UMAP_CAP) {
-        return LUX_ERR_CAPACITY;
-    }
+    assert(ws->umap_n[tile] < LUX_UMAP_CAP);
     ws->umap[tile][ws->umap_n[tile]] = (lux_ref){team, index};
     ws->umap_n[tile] += 1;
-    return LUX_OK;
 }
 
 /* LuxAI_S2.destroy_unit. This doesn't remove the unit from the units map. Python
@@ -34,6 +30,7 @@ static int add_unit(lux_state *s, lux_workspace *ws, int32_t team, int32_t unit_
  * step ends, because the handlers still holding its action keep running it. */
 static void destroy_unit(lux_state *s, lux_workspace *ws, lux_ref r)
 {
+    assert(!ws->dead[r.team][r.index]); /* all_destroyed_units is a set */
     const lux_unit *unit = lux_unit_at(s, r);
     lux_board *b = &s->board;
     int32_t tile = lux_tile(s, unit->x, unit->y);
@@ -55,12 +52,7 @@ static void destroy_factory(lux_state *s, const lux_factory *factory)
         for (int64_t y = y_lo; y < y_hi; y++) {
             int32_t tile = lux_tile(s, x, y);
             b->rubble[tile] += s->env_cfg.FACTORY_RUBBLE_AFTER_DESTRUCTION;
-            /* .clip(0, MAX_RUBBLE) */
-            if (b->rubble[tile] < 0) {
-                b->rubble[tile] = 0;
-            } else if (b->rubble[tile] > s->env_cfg.MAX_RUBBLE) {
-                b->rubble[tile] = s->env_cfg.MAX_RUBBLE;
-            }
+            b->rubble[tile] = py_clip(b->rubble[tile], 0, s->env_cfg.MAX_RUBBLE);
             b->factory_occupancy_map[tile] = -1;
         }
     }
@@ -68,9 +60,10 @@ static void destroy_factory(lux_state *s, const lux_factory *factory)
 
 /* ---- Units map helpers -------------------------------------------------------- */
 
-/* list.remove(unit): drops the first entry naming it. LUX_ERR_STATE where Python
- * raises ValueError (not in the list). */
-static int umap_remove(lux_workspace *ws, int32_t tile, lux_ref r)
+/* list.remove(unit): drops the first entry naming it. A moving unit is still in
+ * the units map at its old tile, so Python's ValueError (not in the list) can't
+ * happen. */
+static void umap_remove(lux_workspace *ws, int32_t tile, lux_ref r)
 {
     for (int32_t i = 0; i < ws->umap_n[tile]; i++) {
         if (ws->umap[tile][i].team == r.team && ws->umap[tile][i].index == r.index) {
@@ -78,37 +71,26 @@ static int umap_remove(lux_workspace *ws, int32_t tile, lux_ref r)
                 ws->umap[tile][j - 1] = ws->umap[tile][j];
             }
             ws->umap_n[tile] -= 1;
-            return LUX_OK;
+            return;
         }
     }
-    return LUX_ERR_STATE;
-}
-
-static void touch(lux_workspace *ws, int32_t tile)
-{
-    if (!ws->is_touched[tile]) {
-        ws->is_touched[tile] = 1;
-        ws->touched[ws->n_touched++] = tile;
-    }
+    assert(0);
 }
 
 /* new_units_map[tile].append(unit) */
-static int new_map_append(lux_workspace *ws, int32_t tile, lux_ref r)
+static void new_map_append(lux_workspace *ws, int32_t tile, lux_ref r)
 {
-    if (ws->new_map_n[tile] >= LUX_NEW_MAP_CAP) {
-        return LUX_ERR_CAPACITY;
-    }
-    touch(ws, tile);
+    assert(ws->new_map_n[tile] < LUX_NEW_MAP_CAP);
     ws->new_map[tile][ws->new_map_n[tile]++] = r;
-    return LUX_OK;
 }
 
-/* all_destroyed_units.add(unit): a set, so each unit is destroyed once */
-static void destroyed_add(lux_workspace *ws, lux_ref r)
+/* Destroys the tile's units, all but `survivor` when there is one. */
+static void destroy_others(lux_state *s, lux_workspace *ws, const lux_ref *units, int32_t n, const lux_ref *survivor)
 {
-    if (!ws->in_destroyed[r.team][r.index]) {
-        ws->in_destroyed[r.team][r.index] = 1;
-        ws->destroyed[ws->n_destroyed++] = r;
+    for (int32_t j = 0; j < n; j++) {
+        if (survivor == NULL || lux_unit_at(s, units[j])->unit_id != lux_unit_at(s, *survivor)->unit_id) {
+            destroy_unit(s, ws, units[j]);
+        }
     }
 }
 
@@ -144,25 +126,23 @@ static void handle_dig_actions(lux_state *s, lux_workspace *ws)
 }
 
 /* LuxAI_S2._handle_self_destruct_actions */
-static int handle_self_destruct_actions(lux_state *s, lux_workspace *ws)
+static void handle_self_destruct_actions(lux_state *s, lux_workspace *ws)
 {
     for (int32_t i = 0; i < ws->n_acts[ACT_SELF_DESTRUCT]; i++) {
         lux_ref who = ws->acts[ACT_SELF_DESTRUCT][i].who;
         const lux_unit *unit = lux_unit_at(s, who);
         int32_t tile = lux_tile(s, unit->x, unit->y);
-        /* del self.state.board.units_map[pos_hash]: the whole entry */
-        if (ws->umap_n[tile] == 0) {
-            return LUX_ERR_STATE; /* KeyError */
-        }
+        /* del self.state.board.units_map[pos_hash]: the whole entry. The unit is on
+         * it, as one per tile is, so Python's KeyError can't happen. */
+        assert(ws->umap_n[tile] == 1);
         ws->umap_n[tile] = 0;
         destroy_unit(s, ws, who);
     }
-    return LUX_OK;
 }
 
 /* LuxAI_S2._handle_factory_build_actions. Validation already checked metal and
  * power; Python checks them again here, and so does this. */
-static int handle_factory_build_actions(lux_state *s, lux_workspace *ws)
+static void handle_factory_build_actions(lux_state *s, lux_workspace *ws)
 {
     const lux_config *cfg = &s->env_cfg;
     for (int32_t i = 0; i < ws->n_acts[ACT_FACTORY_BUILD]; i++) {
@@ -187,25 +167,24 @@ static int handle_factory_build_actions(lux_state *s, lux_workspace *ws)
             factory_sub_resource(factory, 3, cfg->ROBOTS[LUX_LIGHT].METAL_COST);
             factory_sub_resource(factory, 4, act->power_cost);
         }
-        int rc = add_unit(s, ws, act->who.team, act->unit_type, factory->x, factory->y);
-        if (rc != LUX_OK) {
-            return rc;
-        }
+        add_unit(s, ws, act->who.team, act->unit_type, factory->x, factory->y);
     }
-    return LUX_OK;
 }
 
 /* LuxAI_S2._handle_movement_actions.
  *
  * new_units_map lists, for each tile, the units entering it in move order, then
  * the units staying on it in units_map order. Each tile's collision depends only
- * on its own list, and destroying units commutes (rubble is capped with min, lichen
- * and strain are set), so the order the tiles are visited in doesn't matter: only
- * the order inside each list does. */
-static int move_units(lux_state *s, lux_workspace *ws)
+ * on its own list. Destroying a unit changes only its own tile's rubble, lichen
+ * and strain, which no collision reads, and adding rubble capped with min gives
+ * the same result in any order (RUBBLE_AFTER_DESTRUCTION is never negative, see
+ * lux_config_check). So the tiles can be visited in any order, and each tile's
+ * losers destroyed at once instead of after all tiles: only the order inside each
+ * list matters. */
+static void handle_movement_actions(lux_state *s, lux_workspace *ws)
 {
     const lux_config *cfg = &s->env_cfg;
-    int rc;
+    const int32_t n_tiles = (int32_t)(cfg->map_size * cfg->map_size);
 
     for (int32_t i = 0; i < ws->n_acts[ACT_MOVE]; i++) {
         lux_ref who = ws->acts[ACT_MOVE][i].who;
@@ -225,68 +204,44 @@ static int move_units(lux_state *s, lux_workspace *ws)
             if (ws->umap_n[old_tile] == 1) {
                 ws->umap_n[old_tile] = 0;
             } else {
-                rc = umap_remove(ws, old_tile, who);
-                if (rc != LUX_OK) {
-                    return rc;
-                }
+                umap_remove(ws, old_tile, who);
             }
 
-            rc = new_map_append(ws, new_tile, who);
-            if (rc != LUX_OK) {
-                return rc;
-            }
+            new_map_append(ws, new_tile, who);
             unit->power -= power_required;
 
             if (unit->unit_type == LUX_HEAVY) {
-                if (ws->heavy_entered_n[new_tile] >= LUX_ENTER_CAP) {
-                    return LUX_ERR_CAPACITY;
-                }
+                assert(ws->heavy_entered_n[new_tile] < LUX_ENTER_CAP);
                 ws->heavy_entered[new_tile][ws->heavy_entered_n[new_tile]++] = who;
             } else {
-                if (ws->light_entered_n[new_tile] >= LUX_ENTER_CAP) {
-                    return LUX_ERR_CAPACITY;
-                }
+                assert(ws->light_entered_n[new_tile] < LUX_ENTER_CAP);
                 ws->light_entered[new_tile][ws->light_entered_n[new_tile]++] = who;
             }
         }
         unit_repeat_action(unit, move_action);
     }
 
-    /* add in all the stationary units: every tile still in units_map has its units
-     * standing on it, so visiting each living unit's tile reaches all of them */
-    for (int32_t team = 0; team < 2; team++) {
-        for (int32_t index = 0; index < s->n_units[team]; index++) {
-            if (ws->dead[team][index]) {
-                continue;
-            }
-            const lux_unit *unit = &s->units[team][index];
-            int32_t tile = lux_tile(s, unit->x, unit->y);
-            if (ws->merged[tile] || ws->umap_n[tile] == 0) {
-                continue;
-            }
-            ws->merged[tile] = 1;
-            for (int32_t k = 0; k < ws->umap_n[tile]; k++) {
-                rc = new_map_append(ws, tile, ws->umap[tile][k]);
-                if (rc != LUX_OK) {
-                    return rc;
-                }
-            }
+    /* add in all the stationary units */
+    for (int32_t tile = 0; tile < n_tiles; tile++) {
+        for (int32_t k = 0; k < ws->umap_n[tile]; k++) {
+            new_map_append(ws, tile, ws->umap[tile][k]);
         }
     }
 
-    for (int32_t k = 0; k < ws->n_touched; k++) {
-        int32_t tile = ws->touched[k];
+    /* Each tile of new_units_map, and self.state.board.units_map =
+     * new_units_map_after_collision: every tile still in units_map is in
+     * new_units_map, so writing each one's survivor replaces the whole map. */
+    for (int32_t tile = 0; tile < n_tiles; tile++) {
         const lux_ref *units = ws->new_map[tile];
         int32_t n = ws->new_map_n[tile];
-        ws->has_survivor[tile] = 0;
-        if (n <= 1) {
-            if (n == 1) {
-                ws->survivor[tile] = units[0];
-                ws->has_survivor[tile] = 1;
-            }
+        if (n == 0) {
             continue;
         }
-        if (ws->heavy_entered_n[tile] > 1) {
+        int has_surviving = 0;
+        lux_ref surviving = units[0];
+        if (n == 1) {
+            has_surviving = 1;
+        } else if (ws->heavy_entered_n[tile] > 1) {
             /* all units collide, find the top 2 units by power */
             lux_ref most, next;
             get_top_two_power_units(s, units, n, LUX_HEAVY, &most, &next);
@@ -294,38 +249,21 @@ static int move_units(lux_state *s, lux_workspace *ws)
             const lux_unit *next_most_power_unit = lux_unit_at(s, next);
             if (most_power_unit->power == next_most_power_unit->power) {
                 /* tie, all units break */
-                for (int32_t j = 0; j < n; j++) {
-                    destroyed_add(ws, units[j]);
-                }
             } else {
                 int64_t most_power_unit_power_loss =
                     py_ceil((double)next_most_power_unit->power * cfg->POWER_LOSS_FACTOR);
                 most_power_unit->power -= most_power_unit_power_loss;
-                for (int32_t j = 0; j < n; j++) {
-                    if (lux_unit_at(s, units[j])->unit_id != most_power_unit->unit_id) {
-                        destroyed_add(ws, units[j]);
-                    }
-                }
-                ws->survivor[tile] = most;
-                ws->has_survivor[tile] = 1;
+                has_surviving = 1;
+                surviving = most;
             }
         } else if (ws->heavy_entered_n[tile] > 0) {
             /* all other units collide and break */
-            lux_ref surviving = ws->heavy_entered[tile][0];
-            int64_t surviving_id = lux_unit_at(s, surviving)->unit_id;
-            for (int32_t j = 0; j < n; j++) {
-                if (lux_unit_at(s, units[j])->unit_id != surviving_id) {
-                    destroyed_add(ws, units[j]);
-                }
-            }
-            ws->survivor[tile] = surviving;
-            ws->has_survivor[tile] = 1;
+            has_surviving = 1;
+            surviving = ws->heavy_entered[tile][0];
         } else {
             /* check for stationary heavy unit there */
-            int has_surviving = 0;
-            lux_ref surviving = {0, 0};
             int has_heavy_stationary = 0;
-            lux_ref heavy_stationary = {0, 0};
+            lux_ref heavy_stationary = units[0];
             for (int32_t j = 0; j < n; j++) {
                 if (lux_unit_at(s, units[j])->unit_type == LUX_HEAVY) {
                     if (has_heavy_stationary) {
@@ -352,9 +290,6 @@ static int move_units(lux_state *s, lux_workspace *ws)
                     const lux_unit *next_most_power_unit = lux_unit_at(s, next);
                     if (most_power_unit->power == next_most_power_unit->power) {
                         /* tie, all units break */
-                        for (int32_t j = 0; j < n; j++) {
-                            destroyed_add(ws, units[j]);
-                        }
                     } else {
                         int64_t most_power_unit_power_loss =
                             py_ceil((double)next_most_power_unit->power * cfg->POWER_LOSS_FACTOR);
@@ -368,63 +303,11 @@ static int move_units(lux_state *s, lux_workspace *ws)
                     surviving = ws->light_entered[tile][0];
                 }
             }
-            if (!has_surviving) {
-                for (int32_t j = 0; j < n; j++) {
-                    destroyed_add(ws, units[j]);
-                }
-            } else {
-                int64_t surviving_id = lux_unit_at(s, surviving)->unit_id;
-                for (int32_t j = 0; j < n; j++) {
-                    if (lux_unit_at(s, units[j])->unit_id != surviving_id) {
-                        destroyed_add(ws, units[j]);
-                    }
-                }
-                ws->survivor[tile] = surviving;
-                ws->has_survivor[tile] = 1;
-            }
         }
+        destroy_others(s, ws, units, n, has_surviving ? &surviving : NULL);
+        ws->umap[tile][0] = surviving;
+        ws->umap_n[tile] = has_surviving;
     }
-
-    /* self.state.board.units_map = new_units_map_after_collision. Every tile left in
-     * units_map was touched above, so this replaces it whole. */
-    for (int32_t k = 0; k < ws->n_touched; k++) {
-        int32_t tile = ws->touched[k];
-        if (ws->has_survivor[tile]) {
-            ws->umap[tile][0] = ws->survivor[tile];
-            ws->umap_n[tile] = 1;
-        } else {
-            ws->umap_n[tile] = 0;
-        }
-    }
-
-    for (int32_t k = 0; k < ws->n_destroyed; k++) {
-        destroy_unit(s, ws, ws->destroyed[k]);
-    }
-    return LUX_OK;
-}
-
-/* Runs move_units, then clears its scratch. */
-static int handle_movement_actions(lux_state *s, lux_workspace *ws)
-{
-    ws->n_touched = 0;
-    ws->n_destroyed = 0;
-    int rc = move_units(s, ws);
-
-    /* clear the scratch, also after an error, as the workspace outlives the state */
-    for (int32_t k = 0; k < ws->n_touched; k++) {
-        int32_t tile = ws->touched[k];
-        ws->new_map_n[tile] = 0;
-        ws->heavy_entered_n[tile] = 0;
-        ws->light_entered_n[tile] = 0;
-        ws->merged[tile] = 0;
-        ws->is_touched[tile] = 0;
-    }
-    for (int32_t k = 0; k < ws->n_destroyed; k++) {
-        ws->in_destroyed[ws->destroyed[k].team][ws->destroyed[k].index] = 0;
-    }
-    ws->n_touched = 0;
-    ws->n_destroyed = 0;
-    return rc;
 }
 
 /* LuxAI_S2._handle_recharge_actions: the action stays at the front, unspent, until
@@ -467,7 +350,7 @@ static void handle_factory_water_actions(lux_state *s, lux_workspace *ws)
 /* LuxAI_S2._handle_transfer_actions. It is important to first sub resource from
  * all units, and then add resource to targets. A unit destroyed in a collision
  * this turn still transfers here: its action was collected before it died. */
-static int handle_transfer_actions(lux_state *s, lux_workspace *ws)
+static void handle_transfer_actions(lux_state *s, lux_workspace *ws)
 {
     const lux_config *cfg = &s->env_cfg;
     const lux_act *transfers = ws->acts[ACT_TRANSFER];
@@ -493,40 +376,33 @@ static int handle_transfer_actions(lux_state *s, lux_workspace *ws)
         if (f >= 0) {
             factory_add_resource(&s->factories[unit->team_id][f], transfer_action->resource, transfer_amount);
         } else if (ws->umap_n[tile] > 0) { /* units_there is not None */
-            if (ws->umap_n[tile] != 1) {
-                return LUX_ERR_STATE; /* assert len(units_there) == 1 */
-            }
+            assert(ws->umap_n[tile] == 1); /* Python asserts it: movement left one per tile */
             lux_unit *target_unit = lux_unit_at(s, ws->umap[tile][0]);
             /* add resources to target. This will waste (transfer_amount - actually_transferred) resources */
             unit_add_resource(cfg, target_unit, transfer_action->resource, transfer_amount);
         }
         unit_repeat_action(unit, transfer_action);
     }
-    return LUX_OK;
 }
 
 /* LuxAI_S2._handle_pickup_actions. As with transfers, a unit destroyed in a
  * collision this turn still picks up, and what it picks up is lost. */
-static int handle_pickup_actions(lux_state *s, lux_workspace *ws)
+static void handle_pickup_actions(lux_state *s, lux_workspace *ws)
 {
     const lux_config *cfg = &s->env_cfg;
     for (int32_t i = 0; i < ws->n_acts[ACT_PICKUP]; i++) {
         lux_unit *unit = lux_unit_at(s, ws->acts[ACT_PICKUP][i].who);
         lux_action *pickup_action = ws->acts[ACT_PICKUP][i].action;
-        int err = LUX_OK;
-        lux_factory *factory = board_get_factory_at(s, unit->x, unit->y, &err);
-        if (err != LUX_OK) {
-            return err;
-        }
-        if (factory == NULL) {
-            return LUX_ERR_STATE; /* None.sub_resource raises AttributeError */
-        }
+        lux_factory *factory = board_get_factory_at(s, unit->x, unit->y);
+        /* Python: None.sub_resource raises AttributeError. Validation found the
+         * factory there, a unit picking up doesn't move, and only refining, later,
+         * destroys factories. */
+        assert(factory != NULL);
         int64_t pickup_amount = factory_sub_resource(factory, pickup_action->resource, pickup_action->amount);
         /* may waste resources if tried to pickup more than one can hold. */
         unit_add_resource(cfg, unit, pickup_action->resource, pickup_amount);
         unit_repeat_action(unit, pickup_action);
     }
-    return LUX_OK;
 }
 
 /* ---- The start of step() --------------------------------------------------------- */
@@ -534,13 +410,13 @@ static int handle_pickup_actions(lux_state *s, lux_workspace *ws)
 /* The queue updates of step(), for one player. Python runs them for every player
  * in the actions dict, failed or not, inside a try: the first exception fails the
  * player and skips the rest of its entries. */
-static int update_action_queues(lux_state *s, int32_t team, const lux_agent_commands *cmds, int32_t *failed)
+static void update_action_queues(lux_state *s, int32_t team, const lux_agent_commands *cmds, int32_t *failed)
 {
     const lux_config *cfg = &s->env_cfg;
     for (int32_t i = 0; i < cmds->n_commands; i++) {
         const lux_command *c = &cmds->commands[i];
         if (c->kind == LUX_KEY_FACTORY) {
-            int32_t f = c->id >= 0 ? lux_find_factory(s, team, c->id) : -1;
+            int32_t f = lux_find_factory(s, team, c->id);
             if (f < 0) {
                 *failed = 1; /* KeyError */
                 break;
@@ -550,12 +426,11 @@ static int update_action_queues(lux_state *s, int32_t team, const lux_agent_comm
                 break;
             }
             lux_factory *factory = &s->factories[team][f];
-            if (factory->queue_len >= LUX_FACTORY_QUEUE_CAP) {
-                return LUX_ERR_CAPACITY;
-            }
+            /* empty at the start of the turn, and named once (check_commands) */
+            assert(factory->queue_len < LUX_FACTORY_QUEUE_CAP);
             factory->action_queue[factory->queue_len++] = c->factory_action;
         } else if (c->kind == LUX_KEY_UNIT) {
-            int32_t u = c->id >= 0 ? lux_find_unit(s, team, c->id) : -1;
+            int32_t u = lux_find_unit(s, team, c->id);
             if (u < 0) {
                 *failed = 1; /* KeyError */
                 break;
@@ -589,83 +464,6 @@ static int update_action_queues(lux_state *s, int32_t team, const lux_agent_comm
         }
         /* any other key: neither branch runs */
     }
-    return LUX_OK;
-}
-
-/* Checks the arguments; also that no unit or factory is named twice, which a dict
- * can't do. */
-static int check_commands(const lux_state *s, lux_workspace *ws, const lux_agent_commands commands[2])
-{
-    int rc = LUX_OK;
-    for (int32_t team = 0; team < 2 && rc == LUX_OK; team++) {
-        const lux_agent_commands *cmds = &commands[team];
-        if (cmds->n_commands < 0 || (cmds->n_commands > 0 && cmds->commands == NULL)) {
-            rc = LUX_ERR_ARGUMENT;
-            break;
-        }
-        for (int32_t i = 0; i < cmds->n_commands; i++) {
-            const lux_command *c = &cmds->commands[i];
-            if (c->kind == LUX_KEY_UNIT) {
-                if (c->n_actions < 0 || (c->n_actions > 0 && c->actions == NULL)) {
-                    rc = LUX_ERR_ARGUMENT;
-                    break;
-                }
-                int32_t u = c->id >= 0 ? lux_find_unit(s, team, c->id) : -1;
-                if (u >= 0) {
-                    if (ws->named_unit[team][u]) {
-                        rc = LUX_ERR_ARGUMENT;
-                        break;
-                    }
-                    ws->named_unit[team][u] = 1;
-                }
-            } else if (c->kind == LUX_KEY_FACTORY) {
-                int32_t f = c->id >= 0 ? lux_find_factory(s, team, c->id) : -1;
-                if (f >= 0) {
-                    if (ws->named_factory[team][f]) {
-                        rc = LUX_ERR_ARGUMENT;
-                        break;
-                    }
-                    ws->named_factory[team][f] = 1;
-                }
-            } else if (c->kind != LUX_KEY_OTHER) {
-                rc = LUX_ERR_ARGUMENT;
-                break;
-            }
-        }
-    }
-    /* clear the marks */
-    for (int32_t team = 0; team < 2; team++) {
-        memset(ws->named_unit[team], 0, (size_t)s->n_units[team] * sizeof(ws->named_unit[team][0]));
-        memset(ws->named_factory[team], 0, sizeof(ws->named_factory[team]));
-    }
-    return rc;
-}
-
-/* What the rest of the step relies on about the factories and teams. */
-static int check_factories_and_teams(const lux_state *s)
-{
-    for (int32_t team = 0; team < 2; team++) {
-        if (s->n_factories[team] < 0 || s->n_factories[team] > LUX_MAX_FACTORIES_PER_TEAM) {
-            return LUX_ERR_STATE;
-        }
-        for (int32_t i = 0; i < s->n_factories[team]; i++) {
-            const lux_factory *f = &s->factories[team][i];
-            if (f->team_id != team || f->queue_len < 0 || f->queue_len > LUX_FACTORY_QUEUE_CAP ||
-                !lux_in_bounds(s, f->x, f->y)) {
-                return LUX_ERR_STATE;
-            }
-            /* OrderedDict order is placement order, which is num_id order. It decides
-             * which factory's new unit gets the lower id. */
-            if (i > 0 && s->factories[team][i - 1].num_id >= f->num_id) {
-                return LUX_ERR_STATE;
-            }
-        }
-        if (s->teams[team].n_factory_strains < 0 ||
-            s->teams[team].n_factory_strains > LUX_MAX_FACTORIES_PER_TEAM) {
-            return LUX_ERR_STATE;
-        }
-    }
-    return LUX_OK;
 }
 
 /* ---- step() ---------------------------------------------------------------- */
@@ -691,11 +489,8 @@ int lux_step(lux_state *s, lux_workspace *ws, const lux_agent_commands commands[
     if (s->env_steps == 0 || (cfg->BIDDING_SYSTEM && lux_real_env_steps(s) < 0)) {
         return LUX_ERR_EARLY_GAME;
     }
-    rc = board_build_units_map(s, ws);
-    if (rc != LUX_OK) {
-        return rc;
-    }
-    rc = check_factories_and_teams(s);
+    workspace_reset(ws, s);
+    rc = check_state(s, ws);
     if (rc != LUX_OK) {
         return rc;
     }
@@ -703,12 +498,7 @@ int lux_step(lux_state *s, lux_workspace *ws, const lux_agent_commands commands[
     if (rc != LUX_OK) {
         return rc;
     }
-    for (int32_t team = 0; team < 2; team++) {
-        memset(ws->dead[team], 0, (size_t)s->n_units[team] * sizeof(ws->dead[team][0]));
-    }
-    for (int32_t a = 0; a < ACT_N; a++) {
-        ws->n_acts[a] = 0;
-    }
+    /* From here on, nothing can fail. */
 
     int32_t failed_agents[2] = {0, 0};
 
@@ -722,10 +512,7 @@ int lux_step(lux_state *s, lux_workspace *ws, const lux_agent_commands commands[
     }
 
     for (int32_t team = 0; team < 2; team++) {
-        rc = update_action_queues(s, team, &commands[team], &failed_agents[team]);
-        if (rc != LUX_OK) {
-            return rc;
-        }
+        update_action_queues(s, team, &commands[team], &failed_agents[team]);
     }
 
     /* 2. store actions by type */
@@ -739,10 +526,9 @@ int lux_step(lux_state *s, lux_workspace *ws, const lux_agent_commands commands[
                 continue;
             }
             lux_action *unit_a = &unit->action_queue[0];
-            if (!action_in_space(cfg, unit_a)) {
-                /* only a failed player's queue can hold one, and its game is over */
-                return LUX_ERR_STATE;
-            }
+            /* its queue held actions in the action space (check_units), and this
+             * turn's passed the action space check, or the team would have failed */
+            assert(action_in_space(cfg, unit_a));
             lux_act *act = &ws->acts[unit_a->act_type][ws->n_acts[unit_a->act_type]++];
             act->who = (lux_ref){team, i};
             act->action = unit_a;
@@ -752,18 +538,12 @@ int lux_step(lux_state *s, lux_workspace *ws, const lux_agent_commands commands[
         for (int32_t i = 0; i < s->n_factories[team]; i++) {
             lux_factory *factory = &s->factories[team][i];
             if (factory->queue_len > 0) {
+                /* action_queue.pop(0): the queue holds just this turn's action, which
+                 * format_factory_action accepted */
                 int64_t code = factory->action_queue[0];
-                memmove(&factory->action_queue[0], &factory->action_queue[1],
-                        (size_t)(factory->queue_len - 1) * sizeof(factory->action_queue[0]));
-                factory->queue_len -= 1;
-                int32_t list;
-                if (code == LUX_BUILD_LIGHT || code == LUX_BUILD_HEAVY) {
-                    list = ACT_FACTORY_BUILD;
-                } else if (code == LUX_WATER) {
-                    list = ACT_FACTORY_WATER;
-                } else {
-                    return LUX_ERR_STATE;
-                }
+                factory->queue_len = 0;
+                assert(code == LUX_BUILD_LIGHT || code == LUX_BUILD_HEAVY || code == LUX_WATER);
+                int32_t list = code == LUX_WATER ? ACT_FACTORY_WATER : ACT_FACTORY_BUILD;
                 lux_act *act = &ws->acts[list][ws->n_acts[list]++];
                 act->who = (lux_ref){team, i};
                 act->action = NULL;
@@ -774,24 +554,12 @@ int lux_step(lux_state *s, lux_workspace *ws, const lux_agent_commands commands[
     }
 
     /* 3. validate all actions against current state, throw away impossible actions */
-    rc = validate_actions(s, ws);
-    if (rc != LUX_OK) {
-        return rc;
-    }
+    validate_actions(s, ws);
 
     handle_dig_actions(s, ws);
-    rc = handle_self_destruct_actions(s, ws);
-    if (rc != LUX_OK) {
-        return rc;
-    }
-    rc = handle_factory_build_actions(s, ws);
-    if (rc != LUX_OK) {
-        return rc;
-    }
-    rc = handle_movement_actions(s, ws);
-    if (rc != LUX_OK) {
-        return rc;
-    }
+    handle_self_destruct_actions(s, ws);
+    handle_factory_build_actions(s, ws);
+    handle_movement_actions(s, ws);
     handle_recharge_actions(s, ws);
 
     for (int32_t team = 0; team < 2; team++) {
@@ -802,25 +570,15 @@ int lux_step(lux_state *s, lux_workspace *ws, const lux_agent_commands commands[
     }
 
     handle_factory_water_actions(s, ws);
-    rc = handle_transfer_actions(s, ws);
-    if (rc != LUX_OK) {
-        return rc;
-    }
-    rc = handle_pickup_actions(s, ws);
-    if (rc != LUX_OK) {
-        return rc;
-    }
+    handle_transfer_actions(s, ws);
+    handle_pickup_actions(s, ws);
 
     /* Update lichen */
     for (int64_t x = 0; x < size; x++) {
         for (int64_t y = 0; y < size; y++) {
             int32_t tile = lux_tile(s, x, y);
             b->lichen[tile] -= 1;
-            if (b->lichen[tile] < 0) {
-                b->lichen[tile] = 0;
-            } else if (b->lichen[tile] > cfg->MAX_LICHEN_PER_TILE) {
-                b->lichen[tile] = cfg->MAX_LICHEN_PER_TILE;
-            }
+            b->lichen[tile] = py_clip(b->lichen[tile], 0, cfg->MAX_LICHEN_PER_TILE);
             if (b->lichen[tile] == 0) {
                 b->lichen_strains[tile] = -1;
             }

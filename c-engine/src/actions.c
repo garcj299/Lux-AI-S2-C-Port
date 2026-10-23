@@ -57,13 +57,11 @@ int action_in_space(const lux_config *cfg, const lux_action *a)
 
 /* validate_actions: drops the actions the board makes impossible and sets the
  * power costs. Invalid actions are not evaluated and won't count towards the `n`
- * of actions that execute multiple times. Each list keeps its order.
- * LUX_ERR_STATE where Board.get_factory_at would raise KeyError. */
-int validate_actions(lux_state *s, lux_workspace *ws)
+ * of actions that execute multiple times. Each list keeps its order. */
+void validate_actions(lux_state *s, lux_workspace *ws)
 {
     const lux_config *cfg = &s->env_cfg;
     const lux_board *b = &s->board;
-    int err = LUX_OK;
     int32_t kept;
 
     lux_act *transfers = ws->acts[ACT_TRANSFER];
@@ -103,10 +101,7 @@ int validate_actions(lux_state *s, lux_workspace *ws)
     kept = 0;
     for (int32_t i = 0; i < ws->n_acts[ACT_PICKUP]; i++) {
         const lux_unit *unit = lux_unit_at(s, pickups[i].who);
-        const lux_factory *factory = board_get_factory_at(s, unit->x, unit->y, &err);
-        if (err != LUX_OK) {
-            return err;
-        }
+        const lux_factory *factory = board_get_factory_at(s, unit->x, unit->y);
         if (factory == NULL) {
             continue; /* no factory to pickup from */
         }
@@ -185,6 +180,4 @@ int validate_actions(lux_state *s, lux_workspace *ws)
         waters[kept++] = waters[i];
     }
     ws->n_acts[ACT_FACTORY_WATER] = kept;
-
-    return LUX_OK;
 }

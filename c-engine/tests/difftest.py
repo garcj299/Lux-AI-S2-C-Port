@@ -1,13 +1,18 @@
 """difftest: the Python engine and the C engine side by side.
 
     difftest.py [--seed S] [--games N] [--orders LIST] [--malformed P] [--map-size N]
+                [--require KEYS] [--lib PATH] [--quiet]
 
 Each game is set up by the Python engine (bid and factory placement, which C
-doesn't have yet), copied into C, then played in both engines with the same random
+doesn't have yet), copied into C, then played in both engines with the same
 orders. After every turn the whole game is compared: the board, every unit and
 factory with its queue, the teams, the rewards and who failed. The run stops at
 the first difference and prints it with the command that repeats it: a seed and
 the options give the same games every time.
+
+Most robots and factories get random orders; some robots prospect (dig ice or
+ore and bring it home) and some factories garden (water every turn), since random
+orders never reach those rules (see Orders).
 
 --orders picks the order types sent: "all" (default), "none" (both engines only
 run the end-of-turn rules), or a comma list of move, transfer, pickup, dig,
@@ -19,29 +24,30 @@ order (a key that isn't theirs, a number out of range, a queue over 20, a bad
 factory action). Python fails that player and the game ends after the turn, so
 this checks the failure paths; keep P small.
 
+--require KEYS: tally keys (harness.Coverage) that must not stay at 0; the run
+fails if one does, as its rule went untested. --lib PATH tests another build.
+
 Run it with the repository's .venv:
     make -C c-engine && .venv/bin/python c-engine/tests/difftest.py --games 20
 """
 import argparse
-import contextlib
-import io
 import random
 import sys
 import time
 
 import numpy as np
 
+import harness
 import loader
 import luxc
-from luxai_s2.env import LuxAI_S2
-from luxai_s2.team import FactionTypes
-from luxai_s2.utils.utils import my_turn_to_place_factory
 
-PLAYERS = loader.PLAYERS
+PLAYERS = harness.PLAYERS
 UNIT_ORDERS = {"move": 0, "transfer": 1, "pickup": 2, "dig": 3, "self_destruct": 4, "recharge": 5}
-LUX_MOVE = UNIT_ORDERS["move"]
+LUX_MOVE, LUX_TRANSFER, LUX_PICKUP, LUX_DIG = 0, 1, 2, 3
 FACTORY_ORDERS = {"build": (0, 1), "water": (2,)}
-FACTIONS = [f.name for f in FactionTypes]
+LUX_WATER = 2
+# direction -> (dx, dy), as actions.py's move_deltas
+DELTAS = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0)}
 
 
 def parse_orders(text):
@@ -64,13 +70,24 @@ def parse_orders(text):
 
 class Orders:
     """Random orders from a seeded generator. Values are mostly small, so that
-    orders often do something, with the occasional extreme in range."""
+    orders often do something, with the occasional extreme in range.
+
+    Random orders alone never touch the resource economy or grow lichen far (a
+    robot that digs ice must first walk to it, and lichen spreads only after about
+    20 turns of watering in a row). So some robots are prospectors and some
+    factories gardeners, with a purpose instead of random orders; the others get
+    random ones. Each robot and factory gets its role when first seen."""
 
     def __init__(self, rng, unit_types, factory_codes, malformed):
         self.rng = rng
         self.unit_types = unit_types
         self.factory_codes = factory_codes
         self.malformed = malformed
+        # prospectors need every order they use; gardeners need water orders
+        self.prospecting = {LUX_MOVE, LUX_TRANSFER, LUX_PICKUP, LUX_DIG} <= set(unit_types)
+        self.gardening = LUX_WATER in factory_codes
+        self.roles = {}
+        self.resources = None  # the ice and ore tiles, which never change after setup
 
     def _amount(self):
         rng = self.rng
@@ -96,14 +113,21 @@ class Orders:
         actions = {}
         for player in PLAYERS:
             mine = {}
-            if self.unit_types:
-                for unit_id in state.units[player]:
-                    if rng.random() < 0.25:
-                        mine[unit_id] = self._queue()
-            if self.factory_codes:
-                for factory_id in state.factories[player]:
-                    if rng.random() < 0.3:
-                        mine[factory_id] = rng.choice(self.factory_codes)
+            for unit_id, unit in state.units[player].items():
+                if self._role(unit_id, "prospector", 0.3 if self.prospecting else 0) == "prospector":
+                    queue = self._prospect(state, player, unit)
+                    if queue is not None:
+                        mine[unit_id] = queue
+                elif self.unit_types and rng.random() < 0.25:
+                    mine[unit_id] = self._queue()
+            for factory_id, factory in state.factories[player].items():
+                rich = factory.cargo.water >= 300
+                chance = (0.75 if rich else 0.2) if self.gardening else 0
+                if self._role(factory_id, "gardener", chance) == "gardener":
+                    if factory.cargo.water - factory.water_cost(state.env_cfg) >= 30:
+                        mine[factory_id] = LUX_WATER
+                elif self.factory_codes and rng.random() < 0.3:
+                    mine[factory_id] = rng.choice(self.factory_codes)
             actions[player] = mine
         if LUX_MOVE in self.unit_types:
             self._herd(state, actions)
@@ -112,16 +136,108 @@ class Orders:
             self._break_one(state, actions)
         return actions
 
+    def _role(self, key, role, chance):
+        """key's role: `role` with this chance when first seen, else "random"."""
+        if key not in self.roles:
+            self.roles[key] = role if chance and self.rng.random() < chance else "random"
+        return self.roles[key]
+
+    def _random(self, unit):
+        return self.roles.get(unit.unit_id) == "random"
+
+    # ---- Prospectors ----
+
+    def _prospect(self, state, player, unit):
+        """A prospector's new queue, or None to leave its queue alone. It walks to
+        the nearest tile of its resource, digs until it holds its load or runs low on
+        power, walks home, hands the load to the factory and picks up power. Now and
+        then it replans with a queue still full, which also frees one stuck behind a
+        dropped order (an enemy factory in the way, too little power to move)."""
+        rng = self.rng
+        if unit.action_queue and rng.random() < 0.85:
+            return None
+        plan = self.roles.setdefault(
+            f"{unit.unit_id} plan",
+            {"resource": rng.choice(["ice", "ore"]), "load": rng.choice([0.1, 0.5, 1.0, 2.0])},
+        )
+        ucfg = unit.unit_cfg
+        x, y = int(unit.pos.x), int(unit.pos.y)
+        factories = list(state.factories[player].values())
+        if not factories:
+            return None
+        home = min(factories, key=lambda f: max(abs(int(f.pos.x) - x), abs(int(f.pos.y) - y)))
+        cargo = int(unit.cargo.ice) + int(unit.cargo.ore)
+        if cargo >= plan["load"] * ucfg.CARGO_SPACE or unit.power < ucfg.BATTERY_CAPACITY // 5:
+            side = self._side_of(home, x, y)
+            if side is None:
+                return self._walk(state, player, x, y, int(home.pos.x), int(home.pos.y))
+            # hand over the cargo (direction 0 is the factory tile it stands on),
+            # then fill the battery
+            rows = [[LUX_TRANSFER, side, r, int(amount), 0, 1] for r, amount in ((0, unit.cargo.ice), (1, unit.cargo.ore)) if amount]
+            rows.append([LUX_PICKUP, 0, 4, max(ucfg.BATTERY_CAPACITY - int(unit.power), 0), 0, 1])
+            if side != 0:
+                rows = rows[:-1] + [[LUX_MOVE, side, 0, 0, 0, 1]]
+            return np.array(rows, dtype=np.int64)
+        tx, ty = self._nearest_resource(state, plan["resource"], x, y)
+        if (tx, ty) == (x, y):
+            return np.array([[LUX_DIG, 0, 0, 0, rng.choice([0, 0, 1]), rng.randint(1, 8)]], dtype=np.int64)
+        return self._walk(state, player, x, y, tx, ty)
+
+    @staticmethod
+    def _side_of(factory, x, y):
+        """0 if (x, y) is one of the factory's tiles, the direction of the factory if
+        (x, y) is next to one of them, else None."""
+        fx, fy = int(factory.pos.x), int(factory.pos.y)
+        if abs(fx - x) <= 1 and abs(fy - y) <= 1:
+            return 0
+        for direction, (dx, dy) in DELTAS.items():
+            if abs(fx - x - dx) <= 1 and abs(fy - y - dy) <= 1:
+                return direction
+        return None
+
+    def _nearest_resource(self, state, resource, x, y):
+        if self.resources is None:
+            board = state.board
+            self.resources = {
+                "ice": [tuple(map(int, p)) for p in np.argwhere(board.ice > 0)],
+                "ore": [tuple(map(int, p)) for p in np.argwhere(board.ore > 0)],
+            }
+        tiles = self.resources[resource] or self.resources["ice"] + self.resources["ore"]
+        return min(tiles, key=lambda p: abs(p[0] - x) + abs(p[1] - y))
+
+    def _walk(self, state, player, x, y, tx, ty):
+        """A queue moving from (x, y) toward (tx, ty) along one axis, around enemy
+        factories when it can."""
+        rng = self.rng
+        dx, dy = tx - x, ty - y
+        steps = []
+        if dx:
+            steps.append((2 if dx > 0 else 4, abs(dx)))
+        if dy:
+            steps.append((3 if dy > 0 else 1, abs(dy)))
+        steps.sort(key=lambda step: -step[1])
+        occupancy = state.board.factory_occupancy_map
+        own = {int(f.num_id) for f in state.factories[player].values()}
+        size = state.env_cfg.map_size
+        for direction, distance in steps:
+            nx, ny = x + DELTAS[direction][0], y + DELTAS[direction][1]
+            if 0 <= nx < size and 0 <= ny < size and occupancy[nx, ny] in (-1, *own):
+                n = min(distance, rng.randint(1, 6))
+                return np.array([[LUX_MOVE, direction, 0, 0, 0, n]], dtype=np.int64)
+        return np.array([[LUX_MOVE, rng.randint(1, 4), 0, 0, 0, 1]], dtype=np.int64)
+
+    # ---- Crowding, for collisions ----
+
     def _herd(self, state, actions):
-        """Keeps robots crowded: about half of those without other orders step toward
-        their nearest factory's center, or off it if they are on it."""
+        """Keeps robots crowded: about half of the random ones without other orders
+        step toward their nearest factory's center, or off it if they are on it."""
         rng = self.rng
         for player in PLAYERS:
             factories = list(state.factories[player].values())
             if not factories:
                 continue
             for u in state.units[player].values():
-                if u.unit_id in actions[player] or rng.random() < 0.5:
+                if u.unit_id in actions[player] or not self._random(u) or rng.random() < 0.5:
                     continue
                 ux, uy = int(u.pos.x), int(u.pos.y)
                 f = min(factories, key=lambda f: abs(int(f.pos.x) - ux) + abs(int(f.pos.y) - uy))
@@ -137,7 +253,8 @@ class Orders:
     def _rally(self, state, actions):
         """Random orders almost never send two robots onto one tile in the same turn,
         so collisions decided by power would never come up. Pick a few tiles (where
-        a robot stands, or a factory center) and send every robot next to one onto it."""
+        a robot stands, or a factory center) and send every random robot next to one
+        onto it."""
         rng = self.rng
         units = [u for player in PLAYERS for u in state.units[player].values()]
         if not units:
@@ -150,10 +267,12 @@ class Orders:
         for x, y in spots:
             for u in units:
                 dx, dy = x - int(u.pos.x), y - int(u.pos.y)
-                if abs(dx) + abs(dy) != 1 or rng.random() < 0.2:
+                if abs(dx) + abs(dy) != 1 or not self._random(u) or rng.random() < 0.2:
                     continue
                 direction = {(0, -1): 1, (1, 0): 2, (0, 1): 3, (-1, 0): 4}[(dx, dy)]
                 actions[u.team.agent][u.unit_id] = np.array([[LUX_MOVE, direction, 0, 0, 0, 1]], dtype=np.int64)
+
+    # ---- Malformed orders ----
 
     def _break_one(self, state, actions):
         rng = self.rng
@@ -196,181 +315,6 @@ class Orders:
         actions[player] = dict(items)
 
 
-# ---- What the games exercised -----------------------------------------------------------
-
-
-class Coverage:
-    """Counts what happened in the Python engine during the run, by wrapping some of
-    its functions (they still run unchanged). "No difference" only means something
-    for the situations that actually came up."""
-
-    def __init__(self):
-        self.counts = {}
-
-    def add(self, what, n=1):
-        self.counts[what] = self.counts.get(what, 0) + n
-
-    def install(self):
-        import luxai_s2.env as lux_env
-
-        cov = self
-        validate_actions = lux_env.validate_actions
-        top_two = lux_env.get_top_two_power_units
-        env_cls = lux_env.LuxAI_S2
-        add_unit = env_cls.add_unit
-        destroy_unit = env_cls.destroy_unit
-        destroy_factory = env_cls.destroy_factory
-        movement = env_cls._handle_movement_actions
-        transfer = env_cls._handle_transfer_actions
-        pickup = env_cls._handle_pickup_actions
-        in_movement = [False]
-
-        def counted_validate_actions(env_cfg, state, actions_by_type, verbose=1):
-            given = {kind: len(entries) for kind, entries in actions_by_type.items()}
-            valid = validate_actions(env_cfg, state, actions_by_type, verbose=verbose)
-            for kind, n in given.items():
-                cov.add(f"{kind} orders carried out", len(valid[kind]))
-                cov.add(f"{kind} orders dropped as invalid", n - len(valid[kind]))
-            return valid
-
-        def counted_top_two(units, unit_type):
-            most, next_most = top_two(units, unit_type)
-            powers = sorted((u.power for u in units if u.unit_type == unit_type), reverse=True)
-            cov.add("collisions decided by power")
-            if most.power == next_most.power:
-                cov.add("  ... a tie: all destroyed")
-            elif next_most.power != powers[1]:
-                cov.add("  ... with the wrong second-strongest robot (quirk 1)")
-            return most, next_most
-
-        def counted_add_unit(self, team, unit_type, pos):
-            cov.add("robots built")
-            return add_unit(self, team, unit_type, pos)
-
-        def counted_destroy_unit(self, unit):
-            cov.add("robots destroyed in collisions" if in_movement[0] else "robots self-destructed")
-            return destroy_unit(self, unit)
-
-        def counted_destroy_factory(self, factory):
-            cov.add("factories run dry")
-            return destroy_factory(self, factory)
-
-        def counted_movement(self, actions_by_type):
-            units_map = self.state.board.units_map
-            crowded = {k: list(v) for k, v in units_map.items() if len(v) > 1}
-            cov.add("tiles where a factory built under a standing robot", len(crowded))
-            entered = {
-                f"{u.pos.x + lux_env.move_deltas[a.move_dir][0]},{u.pos.y + lux_env.move_deltas[a.move_dir][1]}"
-                for u, a in actions_by_type["move"]
-                if a.move_dir != 0
-            }
-            in_movement[0] = True
-            try:
-                result = movement(self, actions_by_type)
-            finally:
-                in_movement[0] = False
-            for key, before in crowded.items():
-                heavies = [u for u in before if u.unit_type.name == "HEAVY"]
-                after = self.state.board.units_map.get(key, [])
-                if len(heavies) >= 2 and after and after[0].unit_type.name == "LIGHT":
-                    cov.add("  ... a light survived two standing heavies (quirk 2)")
-                if key not in entered and not after:
-                    cov.add("  ... nobody entered and all standing robots were destroyed (quirk 3)")
-            return result
-
-        def counted_transfer(self, actions_by_type):
-            for unit, _ in actions_by_type["transfer"]:
-                if unit.unit_id not in self.state.units[unit.team.agent]:
-                    cov.add("transfers by robots destroyed that turn (quirk 4)")
-            return transfer(self, actions_by_type)
-
-        def counted_pickup(self, actions_by_type):
-            for unit, _ in actions_by_type["pickup"]:
-                if unit.unit_id not in self.state.units[unit.team.agent]:
-                    cov.add("pickups by robots destroyed that turn (quirk 4)")
-            return pickup(self, actions_by_type)
-
-        lux_env.validate_actions = counted_validate_actions
-        lux_env.get_top_two_power_units = counted_top_two
-        env_cls.add_unit = counted_add_unit
-        env_cls.destroy_unit = counted_destroy_unit
-        env_cls.destroy_factory = counted_destroy_factory
-        env_cls._handle_movement_actions = counted_movement
-        env_cls._handle_transfer_actions = counted_transfer
-        env_cls._handle_pickup_actions = counted_pickup
-
-    # the report's order; zeros are shown, so what never happened is visible
-    REPORT_ORDER = [
-        *[
-            f"{kind} orders {verdict}"
-            for kind in ("move", "transfer", "pickup", "dig", "self_destruct", "recharge", "factory_build", "factory_water")
-            for verdict in ("carried out", "dropped as invalid")
-        ],
-        "robots built",
-        "robots self-destructed",
-        "robots destroyed in collisions",
-        "collisions decided by power",
-        "  ... a tie: all destroyed",
-        "  ... with the wrong second-strongest robot (quirk 1)",
-        "tiles where a factory built under a standing robot",
-        "  ... a light survived two standing heavies (quirk 2)",
-        "  ... nobody entered and all standing robots were destroyed (quirk 3)",
-        "transfers by robots destroyed that turn (quirk 4)",
-        "pickups by robots destroyed that turn (quirk 4)",
-        "factories run dry",
-        "players who lost all their factories",
-        "players failed by a malformed order",
-    ]
-
-    def report(self):
-        keys = self.REPORT_ORDER + [k for k in self.counts if k not in self.REPORT_ORDER]
-        width = max(len(k) for k in keys)
-        return [f"  {k.ljust(width)}  {self.counts.get(k, 0)}" for k in keys]
-
-
-# ---- Setting a game up in Python --------------------------------------------------------
-
-
-def play_setup(env, rng):
-    """The bid and the factory placement, by the Python engine, with random but legal
-    choices. Each team spreads its water and metal one of three ways: 150 each like
-    the starter bot, at random, or all of it into its first factory (which can then
-    last the whole 1000 turns, while the others run dry at once). Returns False if a
-    player failed (so the game never started)."""
-    bids = {p: {"faction": rng.choice(FACTIONS), "bid": rng.choice([0, 0, 0, rng.randint(-10, 10)])} for p in PLAYERS}
-    spread = {p: rng.choice(["starter", "starter", "random", "hoard"]) for p in PLAYERS}
-    _, _, terminations, _, _ = quiet_step(env, bids)
-    if any(terminations.values()):
-        return False
-    while env.state.real_env_steps < 0:
-        actions = {}
-        for player in PLAYERS:
-            team = env.state.teams[player]
-            if team.factories_to_place > 0 and my_turn_to_place_factory(team.place_first, env.state.env_steps):
-                spawns = np.argwhere(env.state.board.valid_spawns_mask)
-                x, y = spawns[rng.randrange(len(spawns))]
-                if spread[player] == "starter":
-                    water, metal = 150, 150
-                elif spread[player] == "random":
-                    water = rng.randint(0, int(team.init_water))
-                    metal = rng.randint(0, int(team.init_metal))
-                else:
-                    water, metal = int(team.init_water), int(team.init_metal)
-                actions[player] = {"spawn": [int(x), int(y)], "water": water, "metal": metal}
-            else:
-                actions[player] = {}
-        _, _, terminations, _, _ = quiet_step(env, actions)
-        if any(terminations.values()):
-            return False
-    return True
-
-
-def quiet_step(env, actions):
-    """env.step without the tracebacks Python prints for a player's bad orders."""
-    with contextlib.redirect_stdout(io.StringIO()):
-        return env.step(actions)
-
-
 # ---- One game -------------------------------------------------------------------------
 
 
@@ -378,13 +322,10 @@ def play_game(lib, ws, seed, args, unit_types, factory_codes, coverage):
     """Plays one game in both engines. Returns (turns played, None) if they agree
     every turn, or (turn, report lines) at the first difference."""
     rng = random.Random(seed)
-    env_kwargs = {"verbose": 0}
-    if args.map_size:
-        env_kwargs["map_size"] = args.map_size
-    env = LuxAI_S2(**env_kwargs)
-    env.reset(seed=seed)
-    if not play_setup(env, rng):
-        return 0, None
+    env = harness.new_game(seed, rng, args.map_size)
+    if env is None:
+        # play_setup makes only legal choices, so this is the tester's bug
+        return 0, ["Python refused a bid or a factory placement during setup"]
 
     problems = loader.check_python_invariants(env)
     if problems:
@@ -397,31 +338,11 @@ def play_game(lib, ws, seed, args, unit_types, factory_codes, coverage):
             return 0, ["the loaded C state differs from Python before any turn:"] + diffs
 
         orders = Orders(rng, unit_types, factory_codes, args.malformed)
-        result = luxc.StepResult()
         turn = 0
         while env.agents:
             turn = env.state.real_env_steps
             actions = orders.turn(env.state)
-            commands, keep = loader.commands_from_actions(actions)
-            _, rewards, terminations, truncations, _ = quiet_step(env, actions)
-            for player in PLAYERS:
-                if truncations[player]:
-                    lost = not env.state.factories[player]
-                    coverage.add("players who lost all their factories" if lost else "players failed by a malformed order")
-            rc = lib.lux_step(cstate, ws, commands, result)
-            del keep
-            if rc != luxc.OK:
-                return turn, [f"lux_step returned {luxc.error_name(rc)}; Python played the turn"]
-
-            report = []
-            for t, player in enumerate(PLAYERS):
-                if int(rewards[player]) != result.rewards[t]:
-                    report.append(f"reward of {player}: python {int(rewards[player])}, C {result.rewards[t]}")
-                if bool(truncations[player]) != bool(result.failed[t]):
-                    report.append(f"failed {player}: python {bool(truncations[player])}, C {bool(result.failed[t])}")
-                if bool(terminations[player]) != bool(result.done):
-                    report.append(f"done for {player}: python {bool(terminations[player])}, C {bool(result.done)}")
-            report += loader.compare(loader.snapshot_python(env), loader.snapshot_c(cstate))
+            report = harness.step_both(lib, ws, env, cstate, actions, coverage)
             if report:
                 return turn, ["after this turn's orders:", *describe_actions(actions)] + ["differences:"] + report
             if env.agents:
@@ -452,12 +373,18 @@ def main(argv=None):
     parser.add_argument("--orders", default="all", help='"all", "none", or a comma list (see the module doc)')
     parser.add_argument("--malformed", type=float, default=0.0, help="per-turn chance of a malformed order (default 0)")
     parser.add_argument("--map-size", type=int, default=None, help="map size (default: the engine's, 64)")
+    parser.add_argument("--require", default="", help="tally keys that must not stay at 0, split by commas or spaces")
+    parser.add_argument("--lib", default=luxc.LIB_PATH, help="the library to test (default: build/liblux.so)")
     parser.add_argument("--quiet", action="store_true", help="no line per game, only the summary")
     args = parser.parse_args(argv)
     unit_types, factory_codes = parse_orders(args.orders)
+    required = args.require.replace(",", " ").split()
+    unknown = [key for key in required if key not in harness.Coverage.LABELS and not key.startswith("raised_")]
+    if unknown:
+        raise SystemExit(f"unknown tally keys: {', '.join(unknown)}")
 
-    lib = luxc.load()
-    coverage = Coverage()
+    lib = luxc.load(args.lib)
+    coverage = harness.Coverage()
     coverage.install()
     ws = lib.lux_workspace_new()
     if not ws:
@@ -471,7 +398,7 @@ def main(argv=None):
             total_turns += turns
             lengths.append(turns)
             if report:
-                print(f"seed {seed}: DIFFERENT at turn {turns}")
+                print(f"seed {seed}: FAILED at turn {turns}")
                 for line in report:
                     print(f"  {line}")
                 repeat = [f"--seed {seed}", "--games 1", f"--orders {args.orders}"]
@@ -491,6 +418,10 @@ def main(argv=None):
     print("what the games exercised (counted in the Python engine):")
     for line in coverage.report():
         print(line)
+    missing = coverage.missing(required)
+    if missing:
+        print("never happened, though required: " + ", ".join(f"{k} ({coverage.label(k).strip()})" for k in missing))
+        return 1
     return 0
 
 

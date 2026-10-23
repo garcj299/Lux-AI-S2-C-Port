@@ -1,6 +1,6 @@
 """scenarios: hand-built turns for the cases random games rarely or never reach.
 
-    scenarios.py [--seed S]
+    scenarios.py [--seed S] [--lib PATH]
 
 Each scenario takes a game just past setup, puts robots on chosen tiles with
 chosen power (through the Python engine's own add_unit, as a factory would), gives
@@ -17,10 +17,9 @@ import sys
 
 import numpy as np
 
-import difftest
+import harness
 import loader
 import luxc
-from luxai_s2.env import LuxAI_S2
 from luxai_s2.unit import UnitType
 
 # directions: 1 up, 2 right, 3 down, 4 left
@@ -46,6 +45,7 @@ class Scene:
         else:
             raise RuntimeError("no factory of player_0 has room to its right")
         self.x, self.y = int(self.factory.pos.x), int(self.factory.pos.y)
+        self.enemy = next(iter(state.factories["player_1"].values()))
 
     def clear_tile(self, x, y):
         """No rubble, ice, ore or lichen on (x, y)."""
@@ -89,7 +89,7 @@ def heavies_wrong_second(scene):
     actions = {"player_0": {a: move(DOWN), b: move(LEFT), c: move(UP)}, "player_1": {}}
 
     def check(tally):
-        if not tally.get("  ... with the wrong second-strongest robot (quirk 1)"):
+        if not tally.get("quirk1"):
             return "the quirk didn't happen"
         if not scene.alive(b) or scene.alive(a) or scene.alive(c):
             return "the strongest heavy should be the only survivor"
@@ -107,10 +107,25 @@ def lights_wrong_second(scene):
     actions = {"player_0": {a: move(DOWN), b: move(LEFT), c: move(UP)}, "player_1": {}}
 
     def check(tally):
-        if not tally.get("  ... with the wrong second-strongest robot (quirk 1)"):
+        if not tally.get("quirk1"):
             return "the quirk didn't happen"
         if not scene.alive(b) or scene.alive(a) or scene.alive(c):
             return "the strongest light should be the only survivor"
+        return None
+
+    return actions, check
+
+
+def lights_tie(scene):
+    """Two lights with the same power enter one tile: both are destroyed."""
+    x, y = scene.x, scene.y
+    a = scene.place(UnitType.LIGHT, x - 1, y, 40)
+    b = scene.place(UnitType.LIGHT, x + 1, y, 40)
+    actions = {"player_0": {a: move(RIGHT), b: move(LEFT)}, "player_1": {}}
+
+    def check(tally):
+        if not tally.get("tie") or scene.alive(a) or scene.alive(b):
+            return "both lights should be destroyed in a tie"
         return None
 
     return actions, check
@@ -124,7 +139,7 @@ def heavies_tie(scene):
     actions = {"player_0": {a: move(DOWN), b: move(UP)}, "player_1": {}}
 
     def check(tally):
-        if not tally.get("  ... a tie: all destroyed") or scene.alive(a) or scene.alive(b):
+        if not tally.get("tie") or scene.alive(a) or scene.alive(b):
             return "both heavies should be destroyed in a tie"
         return None
 
@@ -142,7 +157,7 @@ def light_beats_two_heavies(scene):
     actions = {"player_0": {light: move(LEFT), scene.factory.unit_id: 1}, "player_1": {}}
 
     def check(tally):
-        if not tally.get("  ... a light survived two standing heavies (quirk 2)"):
+        if not tally.get("quirk2"):
             return "the quirk didn't happen"
         if not scene.alive(light) or scene.alive(heavy):
             return "the light should survive and the heavy be destroyed"
@@ -161,7 +176,7 @@ def two_standing_lights(scene):
     actions = {"player_0": {scene.factory.unit_id: 0}, "player_1": {}}
 
     def check(tally):
-        if not tally.get("  ... nobody entered and all standing robots were destroyed (quirk 3)"):
+        if not tally.get("quirk3"):
             return "the quirk didn't happen"
         if scene.alive(light):
             return "the standing light should be destroyed"
@@ -197,7 +212,7 @@ def dead_robot_transfers(scene):
     actions = {"player_0": {light: give, heavy: move(DOWN)}, "player_1": {}}
 
     def check(tally):
-        if not tally.get("transfers by robots destroyed that turn (quirk 4)") or scene.alive(light):
+        if not tally.get("quirk4_transfer") or scene.alive(light):
             return "the light should be destroyed and still transfer"
         return None
 
@@ -214,7 +229,7 @@ def dead_robot_picks_up(scene):
     actions = {"player_0": {light: take, heavy: move(LEFT)}, "player_1": {}}
 
     def check(tally):
-        if not tally.get("pickups by robots destroyed that turn (quirk 4)") or scene.alive(light):
+        if not tally.get("quirk4_pickup") or scene.alive(light):
             return "the light should be destroyed and still pick up"
         return None
 
@@ -232,7 +247,7 @@ def watering_checks_last_turns_cost(scene):
 
     def check(tally):
         fresh_cost = -(-len(factory.grow_lichen_positions) // 10)
-        if not tally.get("factory_water orders dropped as invalid") or fresh_cost > 2:
+        if not tally.get("factory_water_dropped") or fresh_cost > 2:
             return "the order should be dropped although this turn's cost fits"
         return None
 
@@ -280,6 +295,45 @@ def move_cost_before_digs(scene):
     return actions, check
 
 
+def move_onto_enemy_factory(scene):
+    """A light next to an enemy factory tries to step onto it: validation drops the
+    move, so it stays where it is and pays nothing for it."""
+    size = scene.env.state.env_cfg.map_size
+    ex, ey = int(scene.enemy.pos.x), int(scene.enemy.pos.y)
+    x, direction = (ex + 2, LEFT) if ex + 2 < size else (ex - 2, RIGHT)
+    if scene.env.state.board.factory_occupancy_map[x, ey] != -1:
+        raise RuntimeError("the tile next to the enemy factory is another factory's")
+    scene.clear_tile(x, ey)
+    light = scene.place(UnitType.LIGHT, x, ey, 50)
+    actions = {"player_0": {light: move(direction)}, "player_1": {}}
+
+    def check(tally):
+        unit = scene.env.state.units["player_0"].get(light)
+        if not tally.get("move_dropped") or unit is None or (int(unit.pos.x), int(unit.pos.y)) != (x, ey):
+            return "the move should be dropped and the light stay put"
+        return None
+
+    return actions, check
+
+
+def dig_into_full_hold(scene):
+    """A light with 99 of its 100 cargo in ice digs ice: it gains 1, not
+    DIG_RESOURCE_GAIN (2); the rest is lost."""
+    x, y = scene.x + 2, scene.y
+    scene.clear_tile(x, y)
+    scene.env.state.board.ice[x, y] = 1
+    light = scene.place(UnitType.LIGHT, x, y, 50, ice=99)
+    actions = {"player_0": {light: np.array([[3, 0, 0, 0, 0, 1]], dtype=np.int64)}, "player_1": {}}
+
+    def check(tally):
+        held = int(scene.env.state.units["player_0"][light].cargo.ice)
+        if not tally.get("dig_full") or held != 100:
+            return f"the light should dig into a full hold and hold 100 ice, holds {held}"
+        return None
+
+    return actions, check
+
+
 def transfer_to_enemy(scene):
     """A light can transfer to an enemy robot next to it."""
     x, y = scene.x + 2, scene.y
@@ -303,6 +357,7 @@ SCENARIOS = [
     heavies_wrong_second,
     lights_wrong_second,
     heavies_tie,
+    lights_tie,
     light_beats_two_heavies,
     two_standing_lights,
     heavy_and_light_standing,
@@ -311,16 +366,16 @@ SCENARIOS = [
     watering_checks_last_turns_cost,
     dig_out_last_lichen,
     move_cost_before_digs,
+    move_onto_enemy_factory,
+    dig_into_full_hold,
     transfer_to_enemy,
 ]
 
 
 def run_scenario(lib, ws, coverage, build, seed):
     """Plays the scenario's turn in both engines. Returns a list of problems."""
-    rng = random.Random(seed)
-    env = LuxAI_S2(verbose=0)
-    env.reset(seed=seed)
-    if not difftest.play_setup(env, rng):
+    env = harness.new_game(seed, random.Random(seed))
+    if env is None:
         return ["the setup failed"]
     scene = Scene(env)
     actions, check = build(scene)
@@ -331,26 +386,11 @@ def run_scenario(lib, ws, coverage, build, seed):
         if diffs:
             return ["the loaded C state differs from Python:"] + diffs
         before = dict(coverage.counts)
-        commands, keep = loader.commands_from_actions(actions)
-        _, rewards, terminations, truncations, _ = difftest.quiet_step(env, actions)
-        result = luxc.StepResult()
-        rc = lib.lux_step(cstate, ws, commands, result)
-        del keep
-        if rc != luxc.OK:
-            return [f"lux_step returned {luxc.error_name(rc)}"]
+        problems = harness.step_both(lib, ws, env, cstate, actions, coverage)
         tally = {k: v - before.get(k, 0) for k, v in coverage.counts.items()}
-        problems = []
         premise = check(tally)
         if premise:
-            problems.append(f"the scenario didn't set its case up in Python: {premise}")
-        for t, player in enumerate(loader.PLAYERS):
-            if int(rewards[player]) != result.rewards[t]:
-                problems.append(f"reward of {player}: python {int(rewards[player])}, C {result.rewards[t]}")
-            if bool(truncations[player]) != bool(result.failed[t]):
-                problems.append(f"failed {player}: python {bool(truncations[player])}, C {bool(result.failed[t])}")
-            if bool(terminations[player]) != bool(result.done):
-                problems.append(f"done for {player}: python {bool(terminations[player])}, C {bool(result.done)}")
-        problems += loader.compare(loader.snapshot_python(env), loader.snapshot_c(cstate))
+            problems.insert(0, f"the scenario didn't set its case up in Python: {premise}")
         return problems
     finally:
         lib.lux_state_free(cstate)
@@ -359,10 +399,11 @@ def run_scenario(lib, ws, coverage, build, seed):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Hand-built turns for rare cases, in both engines.")
     parser.add_argument("--seed", type=int, default=0, help="seed of the game each scenario starts from")
+    parser.add_argument("--lib", default=luxc.LIB_PATH, help="the library to test (default: build/liblux.so)")
     args = parser.parse_args(argv)
 
-    lib = luxc.load()
-    coverage = difftest.Coverage()
+    lib = luxc.load(args.lib)
+    coverage = harness.Coverage()
     coverage.install()
     ws = lib.lux_workspace_new()
     if not ws:

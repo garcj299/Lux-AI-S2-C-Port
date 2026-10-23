@@ -31,28 +31,27 @@
 /* EnvConfig.MAX_FACTORIES: a team places at most factories_per_team factories. */
 #define LUX_MAX_FACTORIES_PER_TEAM 10
 
-/* At the end of every turn there is at most one unit per tile, and during a turn
- * each factory builds at most one more. So this bound can never be reached. */
+/* Between turns there is at most one unit per tile, and during a turn each factory
+ * builds at most one more. So this bound can never be reached. */
 #define LUX_MAX_UNITS_PER_TEAM (LUX_MAX_TILES + LUX_MAX_FACTORIES_PER_TEAM)
 
 /* EnvConfig.UNIT_ACTION_QUEUE_SIZE. */
 #define LUX_MAX_QUEUE 20
 
-/* A factory's queue gets at most one action per turn and loses it the same turn,
- * unless the team failed, which ends the game. So it never holds more than 2. */
-#define LUX_FACTORY_QUEUE_CAP 4
+/* A factory's queue gets at most one action per turn and loses it the same turn.
+ * Only a failed team keeps its last one, and that ends the game. So the queue is
+ * empty at the start of every turn and never holds more than 1. */
+#define LUX_FACTORY_QUEUE_CAP 1
 
 /* ---- Return codes ----------------------------------------------------------- */
 
 enum {
     LUX_OK = 0,
-    LUX_ERR_ARGUMENT = -1,   /* NULL pointer, negative count or a repeated key */
+    LUX_ERR_ARGUMENT = -1,   /* NULL pointer, negative count, bad key kind or a repeated key */
     LUX_ERR_GAME_OVER = -2,  /* the game has ended (Python's step would raise) */
     LUX_ERR_EARLY_GAME = -3, /* bid or factory placement: not ported yet */
     LUX_ERR_CONFIG = -4,     /* a config this port doesn't support (see lux_config_check) */
-    LUX_ERR_STATE = -5,      /* the state breaks an invariant every reachable Python state keeps */
-    LUX_ERR_CAPACITY = -6,   /* a fixed array would overflow; impossible within the bounds above */
-    LUX_ERR_NO_MEMORY = -7
+    LUX_ERR_STATE = -5       /* the state breaks an invariant every reachable Python state keeps */
 };
 
 /* ---- Enumerations --------------------------------------------------------- */
@@ -134,10 +133,14 @@ typedef struct {
 /* EnvConfig(): the defaults of luxai_s2 3.0.1. */
 LUX_API void lux_config_default(lux_config *cfg);
 
-/* LUX_OK, or LUX_ERR_CONFIG for a config this port doesn't support: map_size
- * above LUX_MAX_MAP_SIZE, more factories or a longer queue than the capacities,
- * a zero divisor, or validate_action_space off (without that check, Python lets
- * out-of-range numbers into the queues, then crashes on some and wraps others). */
+/* LUX_OK, or LUX_ERR_CONFIG for a config this port doesn't support:
+ * - map_size above LUX_MAX_MAP_SIZE, more factories or a longer queue than the
+ *   capacities, or a zero divisor;
+ * - validate_action_space off: without that check, Python lets out-of-range
+ *   numbers into the queues, then crashes on some and wraps others;
+ * - a negative RUBBLE_AFTER_DESTRUCTION: the rubble a collision leaves would then
+ *   depend on the order Python destroys the robots in, which is a set's;
+ * - BIDDING_SYSTEM off: untested, so not claimed. */
 LUX_API int lux_config_check(const lux_config *cfg);
 
 /* ---- Game state ------------------------------------------------------------- */
@@ -245,14 +248,15 @@ LUX_API void lux_state_free(lux_state *state);
 /* state.py State.real_env_steps: env_steps minus the bid and placement turns. */
 LUX_API int64_t lux_real_env_steps(const lux_state *state);
 
-/* The sizes and offsets of this header's types, for bindings in other languages
- * to check their copy of the layout against. Writes up to n values to out, in
- * this order, and returns how many there are:
- *   sizeof lux_config, lux_unit_config, lux_action, lux_unit, lux_factory,
- *   lux_team, lux_board, lux_state, lux_command, lux_agent_commands,
- *   lux_step_result; offsetof lux_config.ROBOTS, lux_unit.action_queue,
- *   lux_state.teams, lux_state.board, lux_state.factories, lux_state.units. */
-LUX_API int32_t lux_layout(int64_t *out, int32_t n);
+/* This header's layout and constants by name, for bindings in other languages to
+ * check their copy against: "sizeof(lux_unit)", "offsetof(lux_unit, power)",
+ * "sizeof(lux_unit.power)", "LUX_MAX_QUEUE"... Sets *entries to the table and
+ * returns its length. */
+typedef struct {
+    const char *name;
+    int64_t value;
+} lux_layout_entry;
+LUX_API int32_t lux_layout(const lux_layout_entry **entries);
 
 /* ---- Actions for one turn ----------------------------------------------------- */
 
@@ -278,7 +282,9 @@ typedef struct {
     const lux_action *actions;  /* LUX_KEY_UNIT: the raw rows, unformatted */
 } lux_command;
 
-/* A player's actions dict. An empty dict and a missing player behave the same. */
+/* A player's actions dict. An empty dict and a missing player behave the same.
+ * (Python's step raises "No actions given" when the whole actions dict is empty;
+ * lux_step plays the turn.) */
 typedef struct {
     const lux_command *commands;
     int32_t n_commands;
@@ -300,10 +306,10 @@ LUX_API void lux_workspace_free(lux_workspace *ws);
 /* env.py LuxAI_S2.step for one main-game turn: commands[0] are player_0's actions
  * and commands[1] player_1's.
  *
- * LUX_ERR_ARGUMENT, LUX_ERR_GAME_OVER, LUX_ERR_EARLY_GAME, LUX_ERR_CONFIG and an
- * LUX_ERR_STATE found by the opening checks leave the state untouched. An
- * LUX_ERR_STATE or LUX_ERR_CAPACITY found later leaves it half-stepped, as the
- * matching Python exception would. */
+ * All or nothing: every error is found before anything changes, and leaves the
+ * state untouched. LUX_ERR_STATE means the state breaks one of the invariants
+ * every Python state keeps between turns (src/check.c lists them); they are what
+ * makes the rest of the step unable to fail. */
 LUX_API int lux_step(lux_state *state, lux_workspace *ws, const lux_agent_commands commands[2],
              lux_step_result *result);
 

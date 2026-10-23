@@ -5,6 +5,7 @@
 #ifndef LUX_INTERNAL_H
 #define LUX_INTERNAL_H
 
+#include <assert.h>
 #include <stddef.h>
 
 #include "lux.h"
@@ -44,12 +45,15 @@ typedef struct {
 /* Board.units_map holds at most one unit per tile at the start of a turn, plus
  * the unit a factory builds on its center during the turn. */
 #define LUX_UMAP_CAP 2
-/* At most 4 units enter a tile (one from each side) and 2 stay on it. */
+/* At most 4 units enter a tile (one from each side: a unit just built has no
+ * action yet) and 2 stay on it. */
 #define LUX_ENTER_CAP 4
 #define LUX_NEW_MAP_CAP (LUX_ENTER_CAP + LUX_UMAP_CAP)
 /* compute_water_info starts from 12 tiles, then adds each tile at most once. */
 #define LUX_FRONTIER_CAP (12 + LUX_MAX_TILES)
 
+/* A step's scratch memory. workspace_reset clears what a step reads before it
+ * writes it, at the start of every lux_step; the rest is always written first. */
 struct lux_workspace {
     /* ActionsByType */
     lux_act acts[ACT_N][2 * LUX_MAX_UNITS_PER_TEAM];
@@ -63,27 +67,19 @@ struct lux_workspace {
     lux_ref umap[LUX_MAX_TILES][LUX_UMAP_CAP];
     int32_t umap_n[LUX_MAX_TILES];
 
-    /* _handle_movement_actions */
+    /* _handle_movement_actions: new_units_map, heavy_entered_pos, light_entered_pos */
     lux_ref new_map[LUX_MAX_TILES][LUX_NEW_MAP_CAP];
     int32_t new_map_n[LUX_MAX_TILES];
     lux_ref heavy_entered[LUX_MAX_TILES][LUX_ENTER_CAP];
     int32_t heavy_entered_n[LUX_MAX_TILES];
     lux_ref light_entered[LUX_MAX_TILES][LUX_ENTER_CAP];
     int32_t light_entered_n[LUX_MAX_TILES];
-    int32_t touched[LUX_MAX_TILES]; /* the tiles that are keys of new_units_map */
-    int32_t n_touched;
-    uint8_t is_touched[LUX_MAX_TILES];
-    uint8_t merged[LUX_MAX_TILES]; /* stationary units already added for this tile */
-    lux_ref survivor[LUX_MAX_TILES];
-    uint8_t has_survivor[LUX_MAX_TILES];
-    lux_ref destroyed[2 * LUX_MAX_UNITS_PER_TEAM]; /* all_destroyed_units, deduplicated */
-    int32_t n_destroyed;
-    uint8_t in_destroyed[2][LUX_MAX_UNITS_PER_TEAM];
 
-    /* compute_water_info */
+    /* compute_water_info. A tile is in `seen` when its stamp is seen_gen: each call
+     * starts an empty set by moving seen_gen on, instead of clearing every tile. */
     int64_t frontier_x[LUX_FRONTIER_CAP];
     int64_t frontier_y[LUX_FRONTIER_CAP];
-    uint32_t seen_stamp[LUX_MAX_TILES]; /* a tile is in `seen` when its stamp is seen_gen */
+    uint32_t seen_stamp[LUX_MAX_TILES];
     uint32_t seen_gen;
     /* each factory's grow_lichen_positions, as tile indices, from cache_water_info
      * until _handle_factory_water_actions uses them */
@@ -95,7 +91,7 @@ struct lux_workspace {
     /* the refining loop's factories_to_destroy */
     uint8_t factory_destroy[LUX_MAX_FACTORIES_PER_TEAM];
 
-    /* lux_step's argument check: units and factories already named by a command */
+    /* check_commands: units and factories already named by a command */
     uint8_t named_unit[2][LUX_MAX_UNITS_PER_TEAM];
     uint8_t named_factory[2][LUX_MAX_FACTORIES_PER_TEAM];
 };
@@ -117,6 +113,7 @@ static inline lux_unit *lux_unit_at(lux_state *s, lux_ref r)
 }
 
 /* ---- state.c ---- */
+void workspace_reset(lux_workspace *ws, const lux_state *s);
 /* The index of the team's unit with this id, or -1. Units are sorted by id. */
 int32_t lux_find_unit(const lux_state *s, int32_t team, int64_t unit_id);
 /* The index of the team's factory with this num_id, or -1. */
@@ -138,12 +135,17 @@ int64_t factory_water_cost(const lux_factory *f, const lux_config *cfg);
 int64_t factory_add_resource(lux_factory *f, int64_t resource_id, int64_t transfer_amount);
 int64_t factory_sub_resource(lux_factory *f, int64_t resource_id, int64_t amount);
 
+/* ---- check.c ---- */
+/* The invariants of a state between two turns, and the arguments of lux_step:
+ * LUX_OK, or the error lux_step returns. check_state also builds Board.units_map. */
+int check_state(const lux_state *s, lux_workspace *ws);
+int check_commands(const lux_state *s, lux_workspace *ws, const lux_agent_commands commands[2]);
+
 /* ---- map/board.py ---- */
-/* Board.get_factory_at: the factory covering (x, y), or NULL if none. Sets *err to
- * LUX_ERR_STATE when the map names a factory neither team has (Python: KeyError). */
-lux_factory *board_get_factory_at(lux_state *s, int64_t x, int64_t y, int *err);
-/* Board.units_map, rebuilt from the units: LUX_ERR_STATE if a unit is off the map,
- * two share a tile, or units aren't sorted by id within their team. */
+/* Board.get_factory_at: the factory covering (x, y), or NULL if none. */
+lux_factory *board_get_factory_at(lux_state *s, int64_t x, int64_t y);
+/* Board.units_map, rebuilt from the units, which check_state has found on the map:
+ * LUX_ERR_STATE if two of them share a tile. */
 int board_build_units_map(const lux_state *s, lux_workspace *ws);
 
 /* ---- utils/utils.py ---- */
@@ -155,7 +157,7 @@ void get_top_two_power_units(lux_state *s, const lux_ref *units, int32_t n_units
 extern const int64_t lux_move_deltas[5][2];
 int format_action_vec(const lux_action *a, lux_action *act);
 int format_factory_action(int64_t a);
-int validate_actions(lux_state *s, lux_workspace *ws);
+void validate_actions(lux_state *s, lux_workspace *ws);
 /* Every action in a live game's queue passed the action-space check when it was
  * given. 1 if this one is inside those ranges. */
 int action_in_space(const lux_config *cfg, const lux_action *a);
